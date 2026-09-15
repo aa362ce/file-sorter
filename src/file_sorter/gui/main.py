@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -30,11 +31,14 @@ from ..history import record_run
 from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
+ICON_PATH = Path(__file__).resolve().parent / "resources" / "icon.png"
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("file-sorter — duplicate finder")
+        self.setWindowIcon(QIcon(str(ICON_PATH)))
 
         self._worker: Optional[ScanWorker] = None
         self._updating_check = False
@@ -260,6 +264,7 @@ class MainWindow(QMainWindow):
 
 def run() -> None:
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = MainWindow()
     window.resize(900, 600)
     window.show()

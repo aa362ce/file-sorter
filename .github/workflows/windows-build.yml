@@ -26,7 +26,7 @@ jobs:
         run: pyinstaller --onefile --name file-sorter scripts/run_cli.py
 
       - name: Build GUI executable
-        run: pyinstaller --onefile --windowed --name file-sorter-gui scripts/run_gui.py
+        run: pyinstaller --onefile --windowed --name file-sorter-gui --icon src/file_sorter/gui/resources/icon.ico scripts/run_gui.py
 
       - name: Stage artifacts
         run: |
