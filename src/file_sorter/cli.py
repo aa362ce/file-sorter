@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .dedupe import find_duplicates
 from .formatting import human_size
-from .history import load_history, record_run
+from .history import export_history, import_history, load_history, record_run
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show past run history instead of scanning",
     )
+    parser.add_argument(
+        "--export-history",
+        metavar="PATH",
+        help="Export run history to a JSON file instead of scanning",
+    )
+    parser.add_argument(
+        "--import-history",
+        metavar="PATH",
+        help="Import run history from a JSON file instead of scanning (merges with existing)",
+    )
     return parser
 
 
@@ -81,6 +91,25 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.history:
         _print_history()
+        return 0
+
+    if args.export_history:
+        path = Path(args.export_history).expanduser().resolve()
+        count = export_history(path)
+        print(f"Exported {count} run(s) to {path}")
+        return 0
+
+    if args.import_history:
+        path = Path(args.import_history).expanduser().resolve()
+        if not path.is_file():
+            print(f"Error: {path} is not a file")
+            return 1
+        try:
+            added = import_history(path)
+        except (OSError, ValueError) as exc:
+            print(f"Error importing history: {exc}")
+            return 1
+        print(f"Imported {added} new run(s) from {path}")
         return 0
 
     if not args.directories:

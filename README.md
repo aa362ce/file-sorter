@@ -68,6 +68,15 @@ with:
 file-sorter --history
 ```
 
+Export it to a file, or import one back in (merges with what's already
+there -- re-importing the same file is a no-op, matched on timestamp +
+directories):
+
+```bash
+file-sorter --export-history backup.json
+file-sorter --import-history backup.json
+```
+
 ## GUI
 
 A PySide6 desktop app is available as an optional extra:
@@ -84,4 +93,5 @@ the Trash (via `send2trash`), never permanently deleted. Each duplicate
 group defaults to keeping the first copy and checking the rest, and the
 app refuses to let every copy in a group be checked at once, so you can't
 accidentally wipe out a file entirely. "History" shows past runs from
-both the GUI and the CLI.
+both the GUI and the CLI, with "Export..." / "Import..." buttons for the
+same JSON file used by `--export-history` / `--import-history`.
