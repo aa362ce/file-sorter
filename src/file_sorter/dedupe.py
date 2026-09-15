@@ -3,14 +3,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
-ProgressCallback = Callable[[str, int, Optional[int]], None]
-
 from .progress import Progress
+
+ProgressCallback = Callable[[str, int, Optional[int]], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
@@ -82,6 +83,7 @@ class DuplicateGroup:
 class ScanResult:
     groups: list[DuplicateGroup]
     skipped: list[Path]
+    cancelled: bool = False
 
 
 def find_duplicates(
@@ -89,6 +91,7 @@ def find_duplicates(
     *,
     show_progress: bool = False,
     on_progress: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -108,13 +111,27 @@ def find_duplicates(
     given -- `total` is None for stage 1 (unknown until the walk finishes).
     This is how the GUI drives its progress bar without depending on the
     terminal-oriented `Progress` class.
+
+    `cancel_event`, if given, is checked between files; when set, the
+    current stage stops early. A group only counts as a confirmed
+    duplicate once its full hash is computed, so cancelling during stage 1
+    or 2 yields zero groups (nothing confirmed yet) -- cancelling during
+    stage 3 still returns whichever groups were already confirmed. Either
+    way `ScanResult.cancelled` is set so callers can report it.
     """
     skipped: list[Path] = []
+    cancelled = False
+
+    def is_cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
     logger.info("Stage 1/3: scanning directories")
     by_size: dict[int, list[Path]] = defaultdict(list)
     progress = Progress("Scanning", enabled=show_progress)
     for path in iter_files(directories):
+        if is_cancelled():
+            cancelled = True
+            break
         try:
             size = path.stat().st_size
         except OSError as exc:
@@ -128,15 +145,18 @@ def find_duplicates(
     progress.close()
     logger.info("Stage 1/3 done: %d files, %d distinct sizes", progress.count, len(by_size))
 
-    partial_candidates = [p for p in by_size.values() if len(p) >= 2]
-    partial_total = sum(len(p) for p in partial_candidates)
-    logger.info("Stage 2/3: quick-hashing %d candidate file(s)", partial_total)
     by_partial: dict[tuple[int, str], list[Path]] = defaultdict(list)
-    progress = Progress("Quick hash", total=partial_total, enabled=show_progress)
-    for size, paths in by_size.items():
-        if len(paths) < 2:
-            continue
-        for path in paths:
+    if not cancelled:
+        partial_candidates = [
+            (size, path) for size, paths in by_size.items() if len(paths) >= 2 for path in paths
+        ]
+        partial_total = len(partial_candidates)
+        logger.info("Stage 2/3: quick-hashing %d candidate file(s)", partial_total)
+        progress = Progress("Quick hash", total=partial_total, enabled=show_progress)
+        for size, path in partial_candidates:
+            if is_cancelled():
+                cancelled = True
+                break
             try:
                 partial = _partial_hash(path)
             except OSError as exc:
@@ -147,17 +167,18 @@ def find_duplicates(
             progress.update()
             if on_progress:
                 on_progress("Quick hash", progress.count, partial_total)
-    progress.close()
+        progress.close()
 
-    full_candidates = [p for p in by_partial.values() if len(p) >= 2]
-    full_total = sum(len(p) for p in full_candidates)
-    logger.info("Stage 3/3: full-hashing %d candidate file(s)", full_total)
     by_full: dict[str, list[Path]] = defaultdict(list)
-    progress = Progress("Full hash", total=full_total, enabled=show_progress)
-    for paths in by_partial.values():
-        if len(paths) < 2:
-            continue
-        for path in paths:
+    if not cancelled:
+        full_candidates = [path for paths in by_partial.values() if len(paths) >= 2 for path in paths]
+        full_total = len(full_candidates)
+        logger.info("Stage 3/3: full-hashing %d candidate file(s)", full_total)
+        progress = Progress("Full hash", total=full_total, enabled=show_progress)
+        for path in full_candidates:
+            if is_cancelled():
+                cancelled = True
+                break
             try:
                 full = _full_hash(path)
             except OSError as exc:
@@ -168,7 +189,7 @@ def find_duplicates(
             progress.update()
             if on_progress:
                 on_progress("Full hash", progress.count, full_total)
-    progress.close()
+        progress.close()
 
     groups = [
         DuplicateGroup(file_hash=file_hash, size=paths[0].stat().st_size, paths=paths)
@@ -176,5 +197,8 @@ def find_duplicates(
         if len(paths) > 1
     ]
     groups.sort(key=lambda g: g.size * len(g.paths), reverse=True)
-    logger.info("Done: %d duplicate group(s), %d file(s) skipped", len(groups), len(skipped))
-    return ScanResult(groups=groups, skipped=skipped)
+    if cancelled:
+        logger.info("Cancelled: %d duplicate group(s) confirmed so far, %d file(s) skipped", len(groups), len(skipped))
+    else:
+        logger.info("Done: %d duplicate group(s), %d file(s) skipped", len(groups), len(skipped))
+    return ScanResult(groups=groups, skipped=skipped, cancelled=cancelled)

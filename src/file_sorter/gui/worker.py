@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -17,10 +18,15 @@ class ScanWorker(QThread):
     def __init__(self, directories: Iterable[Path], parent=None) -> None:
         super().__init__(parent)
         self._directories = list(directories)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:
         result = find_duplicates(
             self._directories,
             on_progress=lambda stage, count, total: self.progress.emit(stage, count, total),
+            cancel_event=self._cancel_event,
         )
         self.finished_scan.emit(result)

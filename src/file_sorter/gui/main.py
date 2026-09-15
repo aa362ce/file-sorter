@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,8 @@ from send2trash import send2trash
 
 from ..dedupe import DuplicateGroup, ScanResult
 from ..formatting import human_size
+from ..history import record_run
+from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
 
@@ -35,6 +38,8 @@ class MainWindow(QMainWindow):
 
         self._worker: Optional[ScanWorker] = None
         self._updating_check = False
+        self._scan_directories: list[Path] = []
+        self._scan_start: Optional[float] = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -58,11 +63,18 @@ class MainWindow(QMainWindow):
         scan_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan for Duplicates")
         self.scan_btn.clicked.connect(self._start_scan)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self._cancel_scan)
+        self.cancel_btn.setEnabled(False)
+        self.history_btn = QPushButton("History")
+        self.history_btn.clicked.connect(self._show_history)
         self.progress_bar = QProgressBar()
         self.status_label = QLabel("")
         scan_row.addWidget(self.scan_btn)
+        scan_row.addWidget(self.cancel_btn)
         scan_row.addWidget(self.progress_bar, 1)
         scan_row.addWidget(self.status_label)
+        scan_row.addWidget(self.history_btn)
         layout.addLayout(scan_row)
 
         self.results_tree = QTreeWidget()
@@ -103,15 +115,25 @@ class MainWindow(QMainWindow):
             return
 
         self.scan_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
         self.delete_btn.setEnabled(False)
         self.results_tree.clear()
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Scanning...")
 
+        self._scan_directories = directories
+        self._scan_start = time.monotonic()
+
         self._worker = ScanWorker(directories)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_scan.connect(self._on_scan_finished)
         self._worker.start()
+
+    def _cancel_scan(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.status_label.setText("Cancelling...")
 
     def _on_progress(self, stage: str, count: int, total: object) -> None:
         if total:
@@ -124,16 +146,25 @@ class MainWindow(QMainWindow):
 
     def _on_scan_finished(self, result: ScanResult) -> None:
         self.scan_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
 
         for group in result.groups:
             self._add_group(group)
 
+        duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
+        record_run(self._scan_directories, result, duration)
+
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
-        self.status_label.setText(f"{len(result.groups)} duplicate group(s) found{skipped_note}")
+        cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
+        self.status_label.setText(f"{len(result.groups)} duplicate group(s) found{skipped_note}{cancelled_note}")
         self.delete_btn.setEnabled(bool(result.groups))
         self._update_reclaimable_label()
+        self._worker = None
+
+    def _show_history(self) -> None:
+        HistoryDialog(self).exec()
 
     # -- results tree -----------------------------------------------------
 
@@ -217,6 +248,14 @@ class MainWindow(QMainWindow):
         self._update_reclaimable_label()
         if failures:
             QMessageBox.warning(self, "Some files could not be deleted", "\n".join(failures))
+
+    # -- window lifecycle -----------------------------------------------
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(2000)
+        event.accept()
 
 
 def run() -> None:

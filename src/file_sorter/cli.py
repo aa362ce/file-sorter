@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
 from .dedupe import find_duplicates
 from .formatting import human_size
+from .history import load_history, record_run
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "directories",
-        nargs="+",
+        nargs="*",
         help="Directories to scan for duplicates (searched recursively)",
     )
     parser.add_argument(
@@ -41,7 +46,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress the live progress display",
     )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Show past run history instead of scanning",
+    )
     return parser
+
+
+def _print_history() -> None:
+    records = load_history()
+    if not records:
+        print("No run history yet.")
+        return
+    for record in records:
+        when = datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d %H:%M")
+        status = "cancelled" if record.cancelled else "done"
+        print(f"{when}  [{status}]  {', '.join(record.directories)}")
+        print(
+            f"    {record.groups} duplicate group(s), {human_size(record.reclaimable_bytes)} reclaimable, "
+            f"{record.skipped} skipped, {record.duration_seconds:.1f}s"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,6 +79,13 @@ def main(argv: list[str] | None = None) -> int:
         log_level = logging.DEBUG
     logging.basicConfig(level=log_level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
 
+    if args.history:
+        _print_history()
+        return 0
+
+    if not args.directories:
+        build_parser().error("the following arguments are required: directories")
+
     directories = []
     for raw in args.directories:
         path = Path(raw).expanduser().resolve()
@@ -62,13 +94,31 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         directories.append(path)
 
-    result = find_duplicates(directories, show_progress=not args.quiet)
+    cancel_event = threading.Event()
+
+    def handle_sigint(signum, frame):
+        if cancel_event.is_set():
+            print("\nForce quitting.", file=sys.stderr)
+            raise SystemExit(130)
+        cancel_event.set()
+        print("\nCancelling... (press Ctrl+C again to force quit)", file=sys.stderr)
+
+    previous_handler = signal.signal(signal.SIGINT, handle_sigint)
+    start = time.monotonic()
+    try:
+        result = find_duplicates(directories, show_progress=not args.quiet, cancel_event=cancel_event)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+    duration = time.monotonic() - start
+
+    record_run(directories, result, duration)
+
     groups = result.groups
     if args.min_size:
         groups = [g for g in groups if g.size >= args.min_size]
 
     if not groups:
-        print("No duplicates found.")
+        print("No duplicates found." if not result.cancelled else "Scan cancelled before any duplicates were confirmed.")
     else:
         total_wasted = 0
         for group in groups:
@@ -81,7 +131,8 @@ def main(argv: list[str] | None = None) -> int:
             for path in group.paths:
                 print(f"  {path}")
 
-        print(f"\n{len(groups)} duplicate group(s), {human_size(total_wasted)} reclaimable.")
+        note = " (scan cancelled -- partial results)" if result.cancelled else ""
+        print(f"\n{len(groups)} duplicate group(s), {human_size(total_wasted)} reclaimable{note}.")
 
     if result.skipped:
         print(f"\nSkipped {len(result.skipped)} unreadable file(s) (permission denied or removed).")
