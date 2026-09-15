@@ -59,6 +59,21 @@ Press Ctrl+C to cancel a running scan -- the first press asks the scan to
 stop after its current file and reports whatever was already confirmed;
 a second press force-quits immediately.
 
+### Resuming a stopped scan
+
+A cancelled scan saves its progress (which files it had already hashed)
+to `~/.file-sorter/resume_state.json`. Pick up where it left off with:
+
+```bash
+file-sorter --resume
+```
+
+This reuses the same directories and skips re-hashing files that were
+already confirmed or ruled out, so only the files that hadn't been
+reached yet get (re)processed. `--resume` doesn't take directory
+arguments -- it always continues the most recently stopped scan. A scan
+that finishes normally (not cancelled) clears any saved resume state.
+
 ### History
 
 Every run (CLI or GUI) is logged to `~/.file-sorter/history.json`. View it
@@ -87,7 +102,8 @@ file-sorter-gui
 ```
 
 Add one or more directories, click "Scan for Duplicates" (runs off the UI
-thread, so the window stays responsive; "Cancel" stops it early), then
+thread, so the window stays responsive; "Cancel" stops it early -- "Resume
+Last Run" becomes enabled afterward to pick that scan back up), then
 check the copies you want gone and "Delete Checked" -- files are moved to
 the Trash (via `send2trash`), never permanently deleted. Each duplicate
 group defaults to keeping the first copy and checking the rest, and the
