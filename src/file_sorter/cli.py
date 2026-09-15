@@ -12,6 +12,7 @@ from pathlib import Path
 from .dedupe import find_duplicates
 from .formatting import human_size
 from .history import export_history, import_history, load_history, record_run
+from .resume import clear_resume_state, load_resume_state, save_resume_state
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet",
         action="store_true",
         help="Suppress the live progress display",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume the last scan that was cancelled before it finished, instead of starting a new one",
     )
     parser.add_argument(
         "--history",
@@ -112,16 +118,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Imported {added} new run(s) from {path}")
         return 0
 
-    if not args.directories:
-        build_parser().error("the following arguments are required: directories")
-
-    directories = []
-    for raw in args.directories:
-        path = Path(raw).expanduser().resolve()
-        if not path.is_dir():
-            print(f"Error: {path} is not a directory")
+    resume_state = None
+    if args.resume:
+        if args.directories:
+            print("Error: --resume picks up the last stopped scan and doesn't take directories")
             return 1
-        directories.append(path)
+        resume_state = load_resume_state()
+        if resume_state is None:
+            print("No stopped run to resume.")
+            return 1
+        directories = [Path(d) for d in resume_state.directories]
+        for path in directories:
+            if not path.is_dir():
+                print(f"Error: cannot resume -- {path} is no longer a directory")
+                return 1
+    else:
+        if not args.directories:
+            build_parser().error("the following arguments are required: directories")
+
+        directories = []
+        for raw in args.directories:
+            path = Path(raw).expanduser().resolve()
+            if not path.is_dir():
+                print(f"Error: {path} is not a directory")
+                return 1
+            directories.append(path)
 
     cancel_event = threading.Event()
 
@@ -135,12 +156,21 @@ def main(argv: list[str] | None = None) -> int:
     previous_handler = signal.signal(signal.SIGINT, handle_sigint)
     start = time.monotonic()
     try:
-        result = find_duplicates(directories, show_progress=not args.quiet, cancel_event=cancel_event)
+        result = find_duplicates(
+            directories,
+            show_progress=not args.quiet,
+            cancel_event=cancel_event,
+            resume_state=resume_state,
+        )
     finally:
         signal.signal(signal.SIGINT, previous_handler)
     duration = time.monotonic() - start
 
     record_run(directories, result, duration)
+    if result.cancelled and result.resume_state is not None:
+        save_resume_state(result.resume_state)
+    else:
+        clear_resume_state()
 
     groups = result.groups
     if args.min_size:
@@ -165,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if result.skipped:
         print(f"\nSkipped {len(result.skipped)} unreadable file(s) (permission denied or removed).")
+
+    if result.cancelled and result.resume_state is not None:
+        print("\nRun 'file-sorter --resume' to continue this scan where it left off.")
 
     return 0
 

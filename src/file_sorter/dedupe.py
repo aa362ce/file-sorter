@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
 from .progress import Progress
+from .resume import ResumeState
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
 
@@ -84,6 +85,11 @@ class ScanResult:
     groups: list[DuplicateGroup]
     skipped: list[Path]
     cancelled: bool = False
+    resume_state: Optional[ResumeState] = None
+
+
+def _partial_key(size: int, partial_hash: str) -> str:
+    return f"{size}:{partial_hash}"
 
 
 def find_duplicates(
@@ -92,6 +98,7 @@ def find_duplicates(
     show_progress: bool = False,
     on_progress: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
+    resume_state: Optional[ResumeState] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -117,75 +124,146 @@ def find_duplicates(
     duplicate once its full hash is computed, so cancelling during stage 1
     or 2 yields zero groups (nothing confirmed yet) -- cancelling during
     stage 3 still returns whichever groups were already confirmed. Either
-    way `ScanResult.cancelled` is set so callers can report it.
+    way `ScanResult.cancelled` is set so callers can report it, and
+    `ScanResult.resume_state` carries whatever partial progress was made so
+    a later call can pass it back in as `resume_state` to pick up where
+    this one left off instead of redoing already-hashed files.
+
+    `resume_state`, if given, must describe a scan that was cancelled
+    partway through stage 2 or 3 (`stage` "quick_hash" or "full_hash") --
+    the results already computed for the interrupted stage and any earlier
+    stage are reused, and only the files not yet processed at cancellation
+    time are (re)hashed. A `resume_state` with `stage` "scanning" (cancelled
+    during the directory walk, which has nothing worth resuming) is
+    equivalent to passing none.
     """
+    directories = list(directories)
     skipped: list[Path] = []
     cancelled = False
+    cancelled_stage: Optional[str] = None
 
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
-    logger.info("Stage 1/3: scanning directories")
+    resume_stage = resume_state.stage if resume_state is not None else None
+
     by_size: dict[int, list[Path]] = defaultdict(list)
-    progress = Progress("Scanning", enabled=show_progress)
-    for path in iter_files(directories):
-        if is_cancelled():
-            cancelled = True
-            break
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            logger.debug("Skipping unreadable file %s: %s", path, exc)
-            skipped.append(path)
-            continue
-        by_size[size].append(path)
-        progress.update()
-        if on_progress:
-            on_progress("Scanning", progress.count, None)
-    progress.close()
-    logger.info("Stage 1/3 done: %d files, %d distinct sizes", progress.count, len(by_size))
+    if resume_stage in ("quick_hash", "full_hash"):
+        assert resume_state is not None
+        for size_str, paths in resume_state.by_size.items():
+            by_size[int(size_str)] = [Path(p) for p in paths]
+        skipped.extend(Path(p) for p in resume_state.skipped)
+        logger.info("Resuming: stage 1/3 already done (%d distinct sizes)", len(by_size))
+    else:
+        logger.info("Stage 1/3: scanning directories")
+        progress = Progress("Scanning", enabled=show_progress)
+        for path in iter_files(directories):
+            if is_cancelled():
+                cancelled = True
+                cancelled_stage = "scanning"
+                break
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                logger.debug("Skipping unreadable file %s: %s", path, exc)
+                skipped.append(path)
+                continue
+            by_size[size].append(path)
+            progress.update()
+            if on_progress:
+                on_progress("Scanning", progress.count, None)
+        progress.close()
+        logger.info("Stage 1/3 done: %d files, %d distinct sizes", progress.count, len(by_size))
 
     by_partial: dict[tuple[int, str], list[Path]] = defaultdict(list)
+    processed_stage2: list[Path] = []
     if not cancelled:
-        partial_candidates = [
-            (size, path) for size, paths in by_size.items() if len(paths) >= 2 for path in paths
-        ]
+        if resume_stage == "full_hash":
+            assert resume_state is not None
+            for key, paths in resume_state.by_partial.items():
+                size_str, hash_str = key.split(":", 1)
+                by_partial[(int(size_str), hash_str)] = [Path(p) for p in paths]
+            partial_candidates: list[tuple[int, Path]] = []
+            logger.info("Resuming: stage 2/3 already done")
+        else:
+            already_processed: set[Path] = set()
+            if resume_stage == "quick_hash":
+                assert resume_state is not None
+                for key, paths in resume_state.by_partial.items():
+                    size_str, hash_str = key.split(":", 1)
+                    by_partial[(int(size_str), hash_str)] = [Path(p) for p in paths]
+                already_processed = {Path(p) for p in resume_state.processed}
+
+            partial_candidates = [
+                (size, path)
+                for size, paths in by_size.items()
+                if len(paths) >= 2
+                for path in paths
+                if path not in already_processed
+            ]
+            if resume_stage == "quick_hash":
+                logger.info("Resuming stage 2/3: %d candidate file(s) remaining", len(partial_candidates))
+            else:
+                logger.info("Stage 2/3: quick-hashing %d candidate file(s)", len(partial_candidates))
+
         partial_total = len(partial_candidates)
-        logger.info("Stage 2/3: quick-hashing %d candidate file(s)", partial_total)
         progress = Progress("Quick hash", total=partial_total, enabled=show_progress)
         for size, path in partial_candidates:
             if is_cancelled():
                 cancelled = True
+                cancelled_stage = "quick_hash"
                 break
             try:
                 partial = _partial_hash(path)
             except OSError as exc:
                 logger.debug("Skipping unreadable file %s: %s", path, exc)
                 skipped.append(path)
+                processed_stage2.append(path)
                 continue
             by_partial[(size, partial)].append(path)
+            processed_stage2.append(path)
             progress.update()
             if on_progress:
                 on_progress("Quick hash", progress.count, partial_total)
         progress.close()
 
     by_full: dict[str, list[Path]] = defaultdict(list)
+    processed_stage3: list[Path] = []
     if not cancelled:
-        full_candidates = [path for paths in by_partial.values() if len(paths) >= 2 for path in paths]
+        already_processed = set()
+        if resume_stage == "full_hash":
+            assert resume_state is not None
+            for full_hash, paths in resume_state.by_full.items():
+                by_full[full_hash] = [Path(p) for p in paths]
+            already_processed = {Path(p) for p in resume_state.processed}
+
+        full_candidates = [
+            path
+            for paths in by_partial.values()
+            if len(paths) >= 2
+            for path in paths
+            if path not in already_processed
+        ]
         full_total = len(full_candidates)
-        logger.info("Stage 3/3: full-hashing %d candidate file(s)", full_total)
+        if resume_stage == "full_hash":
+            logger.info("Resuming stage 3/3: %d candidate file(s) remaining", full_total)
+        else:
+            logger.info("Stage 3/3: full-hashing %d candidate file(s)", full_total)
         progress = Progress("Full hash", total=full_total, enabled=show_progress)
         for path in full_candidates:
             if is_cancelled():
                 cancelled = True
+                cancelled_stage = "full_hash"
                 break
             try:
                 full = _full_hash(path)
             except OSError as exc:
                 logger.debug("Skipping unreadable file %s: %s", path, exc)
                 skipped.append(path)
+                processed_stage3.append(path)
                 continue
             by_full[full].append(path)
+            processed_stage3.append(path)
             progress.update()
             if on_progress:
                 on_progress("Full hash", progress.count, full_total)
@@ -197,8 +275,27 @@ def find_duplicates(
         if len(paths) > 1
     ]
     groups.sort(key=lambda g: g.size * len(g.paths), reverse=True)
+
+    new_resume_state: Optional[ResumeState] = None
     if cancelled:
         logger.info("Cancelled: %d duplicate group(s) confirmed so far, %d file(s) skipped", len(groups), len(skipped))
+        if cancelled_stage in ("quick_hash", "full_hash"):
+            new_resume_state = ResumeState(
+                directories=[str(d) for d in directories],
+                stage=cancelled_stage,
+                by_size={str(size): [str(p) for p in paths] for size, paths in by_size.items()},
+                by_partial={_partial_key(*key): [str(p) for p in paths] for key, paths in by_partial.items()},
+                by_full={h: [str(p) for p in paths] for h, paths in by_full.items()},
+                processed=[str(p) for p in (processed_stage2 if cancelled_stage == "quick_hash" else processed_stage3)],
+                skipped=[str(p) for p in skipped],
+            )
+        else:
+            new_resume_state = ResumeState(
+                directories=[str(d) for d in directories],
+                stage="scanning",
+                skipped=[str(p) for p in skipped],
+            )
     else:
         logger.info("Done: %d duplicate group(s), %d file(s) skipped", len(groups), len(skipped))
-    return ScanResult(groups=groups, skipped=skipped, cancelled=cancelled)
+
+    return ScanResult(groups=groups, skipped=skipped, cancelled=cancelled, resume_state=new_resume_state)

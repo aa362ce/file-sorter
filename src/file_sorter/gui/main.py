@@ -28,6 +28,7 @@ from send2trash import send2trash
 from ..dedupe import DuplicateGroup, ScanResult
 from ..formatting import human_size
 from ..history import record_run
+from ..resume import ResumeState, clear_resume_state, load_resume_state, save_resume_state
 from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
@@ -66,16 +67,20 @@ class MainWindow(QMainWindow):
 
         scan_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan for Duplicates")
-        self.scan_btn.clicked.connect(self._start_scan)
+        self.scan_btn.clicked.connect(lambda: self._start_scan())
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self._cancel_scan)
         self.cancel_btn.setEnabled(False)
+        self.resume_btn = QPushButton("Resume Last Run")
+        self.resume_btn.clicked.connect(self._resume_scan)
+        self.resume_btn.setEnabled(load_resume_state() is not None)
         self.history_btn = QPushButton("History")
         self.history_btn.clicked.connect(self._show_history)
         self.progress_bar = QProgressBar()
         self.status_label = QLabel("")
         scan_row.addWidget(self.scan_btn)
         scan_row.addWidget(self.cancel_btn)
+        scan_row.addWidget(self.resume_btn)
         scan_row.addWidget(self.progress_bar, 1)
         scan_row.addWidget(self.status_label)
         scan_row.addWidget(self.history_btn)
@@ -112,7 +117,7 @@ class MainWindow(QMainWindow):
 
     # -- scanning -------------------------------------------------------
 
-    def _start_scan(self) -> None:
+    def _start_scan(self, resume_state: Optional[ResumeState] = None) -> None:
         directories = [Path(self.dir_list.item(i).text()) for i in range(self.dir_list.count())]
         if not directories:
             QMessageBox.information(self, "No directories", "Add at least one directory to scan.")
@@ -120,18 +125,31 @@ class MainWindow(QMainWindow):
 
         self.scan_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
         self.delete_btn.setEnabled(False)
         self.results_tree.clear()
         self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Scanning...")
+        self.status_label.setText("Resuming scan..." if resume_state else "Scanning...")
 
         self._scan_directories = directories
         self._scan_start = time.monotonic()
 
-        self._worker = ScanWorker(directories)
+        self._worker = ScanWorker(directories, resume_state=resume_state)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_scan.connect(self._on_scan_finished)
         self._worker.start()
+
+    def _resume_scan(self) -> None:
+        resume_state = load_resume_state()
+        if resume_state is None:
+            QMessageBox.information(self, "Nothing to resume", "There's no stopped run to resume.")
+            self.resume_btn.setEnabled(False)
+            return
+
+        self.dir_list.clear()
+        for directory in resume_state.directories:
+            self.dir_list.addItem(directory)
+        self._start_scan(resume_state=resume_state)
 
     def _cancel_scan(self) -> None:
         if self._worker is not None:
@@ -159,6 +177,13 @@ class MainWindow(QMainWindow):
 
         duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
         record_run(self._scan_directories, result, duration)
+
+        if result.cancelled and result.resume_state is not None:
+            save_resume_state(result.resume_state)
+            self.resume_btn.setEnabled(True)
+        else:
+            clear_resume_state()
+            self.resume_btn.setEnabled(False)
 
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
         cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
