@@ -12,6 +12,10 @@ file to every other file:
 3. **Full hash** — only files that still match on size *and* partial hash
    get fully hashed (SHA-256) to confirm they're byte-for-byte identical.
 
+The partial- and full-hashing stages hash multiple files at once across a
+thread pool, defaulting to one thread per CPU core. Override the count with
+`-j`/`--threads` (e.g. `--threads 1` to hash sequentially).
+
 ## Setup
 
 ```bash

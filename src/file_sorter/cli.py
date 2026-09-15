@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .dedupe import find_duplicates
+from .dedupe import default_workers, find_duplicates
 from .formatting import human_size
 from .history import export_history, import_history, load_history, record_run
 from .resume import clear_resume_state, load_resume_state, save_resume_state
@@ -46,6 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet",
         action="store_true",
         help="Suppress the live progress display",
+    )
+    parser.add_argument(
+        "-j",
+        "--threads",
+        type=int,
+        default=0,
+        metavar="N",
+        help=f"Number of threads to hash files with (default: {default_workers()}, one per CPU core)",
     )
     parser.add_argument(
         "--resume",
@@ -161,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             show_progress=not args.quiet,
             cancel_event=cancel_event,
             resume_state=resume_state,
+            workers=args.threads,
         )
     finally:
         signal.signal(signal.SIGINT, previous_handler)

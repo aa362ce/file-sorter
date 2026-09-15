@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import logging
 import os
@@ -7,7 +8,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
 from .resume import ResumeState
@@ -17,7 +18,15 @@ ProgressCallback = Callable[[str, int, Optional[int]], None]
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
 
+T = TypeVar("T")
+K = TypeVar("K")
+
 logger = logging.getLogger(__name__)
+
+
+def default_workers() -> int:
+    """Worker count used when the caller doesn't request a specific one."""
+    return os.cpu_count() or 1
 
 
 def iter_files(directories: Iterable[Path]) -> Iterator[Path]:
@@ -73,6 +82,83 @@ def _full_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _hash_parallel(
+    items: list[T],
+    *,
+    path_of: Callable[[T], Path],
+    hash_fn: Callable[[Path], str],
+    key_of: Callable[[T, str], K],
+    workers: int,
+    stage_label: str,
+    show_progress: bool,
+    on_progress: Optional[ProgressCallback],
+    is_cancelled: Callable[[], bool],
+) -> tuple[dict[K, list[Path]], list[Path], list[Path], bool]:
+    """Hash `items` into buckets keyed by `key_of`, spreading the reads and
+    hashing across a thread pool of `workers` threads.
+
+    Hashing is a mix of file I/O (which releases the GIL while waiting on
+    the OS) and CPU work in hashlib's C implementation (which also releases
+    the GIL for each chunk), so multiple files can genuinely be read and
+    hashed at the same time instead of one at a time -- `workers` should
+    typically track the number of CPU cores available.
+
+    Cancellation is checked once per batch of `workers` files rather than
+    between every single file, since a whole batch is already in flight
+    together by the time it could be checked; whatever a batch finishes is
+    kept before stopping.
+    """
+    result: dict[K, list[Path]] = defaultdict(list)
+    processed: list[Path] = []
+    skipped: list[Path] = []
+    cancelled = False
+    total = len(items)
+    progress = Progress(stage_label, total=total, enabled=show_progress)
+
+    def record(item: T, digest: Optional[str], error: Optional[OSError]) -> None:
+        path = path_of(item)
+        if error is not None:
+            logger.debug("Skipping unreadable file %s: %s", path, error)
+            skipped.append(path)
+            processed.append(path)
+            return
+        assert digest is not None
+        result[key_of(item, digest)].append(path)
+        processed.append(path)
+        progress.update()
+        if on_progress:
+            on_progress(stage_label, progress.count, total)
+
+    if workers <= 1 or total <= 1:
+        for item in items:
+            if is_cancelled():
+                cancelled = True
+                break
+            try:
+                record(item, hash_fn(path_of(item)), None)
+            except OSError as exc:
+                record(item, None, exc)
+        progress.close()
+        return result, processed, skipped, cancelled
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        index = 0
+        while index < total:
+            if is_cancelled():
+                cancelled = True
+                break
+            batch = items[index : index + workers]
+            futures = [(item, pool.submit(hash_fn, path_of(item))) for item in batch]
+            for item, future in futures:
+                try:
+                    record(item, future.result(), None)
+                except OSError as exc:
+                    record(item, None, exc)
+            index += len(batch)
+    progress.close()
+    return result, processed, skipped, cancelled
+
+
 @dataclass
 class DuplicateGroup:
     file_hash: str
@@ -99,6 +185,7 @@ def find_duplicates(
     on_progress: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     resume_state: Optional[ResumeState] = None,
+    workers: Optional[int] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -136,11 +223,17 @@ def find_duplicates(
     time are (re)hashed. A `resume_state` with `stage` "scanning" (cancelled
     during the directory walk, which has nothing worth resuming) is
     equivalent to passing none.
+
+    `workers` controls how many files stages 2 and 3 (the actual hashing)
+    process concurrently via a thread pool, to take advantage of multiple
+    CPU cores/threads instead of hashing one file at a time. Defaults to
+    `os.cpu_count()`; pass 1 to hash sequentially.
     """
     directories = list(directories)
     skipped: list[Path] = []
     cancelled = False
     cancelled_stage: Optional[str] = None
+    workers = workers if workers and workers > 0 else default_workers()
 
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -206,26 +299,23 @@ def find_duplicates(
             else:
                 logger.info("Stage 2/3: quick-hashing %d candidate file(s)", len(partial_candidates))
 
-        partial_total = len(partial_candidates)
-        progress = Progress("Quick hash", total=partial_total, enabled=show_progress)
-        for size, path in partial_candidates:
-            if is_cancelled():
-                cancelled = True
-                cancelled_stage = "quick_hash"
-                break
-            try:
-                partial = _partial_hash(path)
-            except OSError as exc:
-                logger.debug("Skipping unreadable file %s: %s", path, exc)
-                skipped.append(path)
-                processed_stage2.append(path)
-                continue
-            by_partial[(size, partial)].append(path)
-            processed_stage2.append(path)
-            progress.update()
-            if on_progress:
-                on_progress("Quick hash", progress.count, partial_total)
-        progress.close()
+        hashed, processed_stage2, newly_skipped, stage_cancelled = _hash_parallel(
+            partial_candidates,
+            path_of=lambda item: item[1],
+            hash_fn=_partial_hash,
+            key_of=lambda item, digest: (item[0], digest),
+            workers=workers,
+            stage_label="Quick hash",
+            show_progress=show_progress,
+            on_progress=on_progress,
+            is_cancelled=is_cancelled,
+        )
+        for key, paths in hashed.items():
+            by_partial[key].extend(paths)
+        skipped.extend(newly_skipped)
+        if stage_cancelled:
+            cancelled = True
+            cancelled_stage = "quick_hash"
 
     by_full: dict[str, list[Path]] = defaultdict(list)
     processed_stage3: list[Path] = []
@@ -249,25 +339,23 @@ def find_duplicates(
             logger.info("Resuming stage 3/3: %d candidate file(s) remaining", full_total)
         else:
             logger.info("Stage 3/3: full-hashing %d candidate file(s)", full_total)
-        progress = Progress("Full hash", total=full_total, enabled=show_progress)
-        for path in full_candidates:
-            if is_cancelled():
-                cancelled = True
-                cancelled_stage = "full_hash"
-                break
-            try:
-                full = _full_hash(path)
-            except OSError as exc:
-                logger.debug("Skipping unreadable file %s: %s", path, exc)
-                skipped.append(path)
-                processed_stage3.append(path)
-                continue
-            by_full[full].append(path)
-            processed_stage3.append(path)
-            progress.update()
-            if on_progress:
-                on_progress("Full hash", progress.count, full_total)
-        progress.close()
+        hashed, processed_stage3, newly_skipped, stage_cancelled = _hash_parallel(
+            full_candidates,
+            path_of=lambda path: path,
+            hash_fn=_full_hash,
+            key_of=lambda item, digest: digest,
+            workers=workers,
+            stage_label="Full hash",
+            show_progress=show_progress,
+            on_progress=on_progress,
+            is_cancelled=is_cancelled,
+        )
+        for key, paths in hashed.items():
+            by_full[key].extend(paths)
+        skipped.extend(newly_skipped)
+        if stage_cancelled:
+            cancelled = True
+            cancelled_stage = "full_hash"
 
     groups = [
         DuplicateGroup(file_hash=file_hash, size=paths[0].stat().st_size, paths=paths)
