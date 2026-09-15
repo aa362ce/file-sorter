@@ -54,3 +54,20 @@ it. Use `-v` for stage-level info logs, or `-vv` for per-file debug logs
 file-sorter ~ -v
 file-sorter ~ -q
 ```
+
+## GUI
+
+A PySide6 desktop app is available as an optional extra:
+
+```bash
+pip install -e ".[gui]"
+file-sorter-gui
+```
+
+Add one or more directories, click "Scan for Duplicates" (runs off the UI
+thread, so the window stays responsive), then check the copies you want
+gone and "Delete Checked" -- files are moved to the Trash (via
+`send2trash`), never permanently deleted. Each duplicate group defaults to
+keeping the first copy and checking the rest, and the app refuses to let
+every copy in a group be checked at once, so you can't accidentally wipe
+out a file entirely.

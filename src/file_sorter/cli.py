@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .dedupe import find_duplicates
+from .formatting import human_size
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _human_size(n: float) -> str:
-    n = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}PB"
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -83,13 +75,13 @@ def main(argv: list[str] | None = None) -> int:
             wasted = group.size * (len(group.paths) - 1)
             total_wasted += wasted
             print(
-                f"\n{len(group.paths)} copies, {_human_size(group.size)} each "
+                f"\n{len(group.paths)} copies, {human_size(group.size)} each "
                 f"(sha256 {group.file_hash[:12]}...):"
             )
             for path in group.paths:
                 print(f"  {path}")
 
-        print(f"\n{len(groups)} duplicate group(s), {_human_size(total_wasted)} reclaimable.")
+        print(f"\n{len(groups)} duplicate group(s), {human_size(total_wasted)} reclaimable.")
 
     if result.skipped:
         print(f"\nSkipped {len(result.skipped)} unreadable file(s) (permission denied or removed).")

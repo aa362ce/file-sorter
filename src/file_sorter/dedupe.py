@@ -6,7 +6,9 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator, Optional
+
+ProgressCallback = Callable[[str, int, Optional[int]], None]
 
 from .progress import Progress
 
@@ -82,7 +84,12 @@ class ScanResult:
     skipped: list[Path]
 
 
-def find_duplicates(directories: Iterable[Path], *, show_progress: bool = False) -> ScanResult:
+def find_duplicates(
+    directories: Iterable[Path],
+    *,
+    show_progress: bool = False,
+    on_progress: Optional[ProgressCallback] = None,
+) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
     Each stage is a dict keyed by an increasingly expensive signature, and
@@ -96,6 +103,11 @@ def find_duplicates(directories: Iterable[Path], *, show_progress: bool = False)
 
     Files that can't be read (permission-protected, removed mid-scan, ...)
     are skipped rather than aborting the whole scan.
+
+    `on_progress(stage_label, count, total)` is called after every file if
+    given -- `total` is None for stage 1 (unknown until the walk finishes).
+    This is how the GUI drives its progress bar without depending on the
+    terminal-oriented `Progress` class.
     """
     skipped: list[Path] = []
 
@@ -111,6 +123,8 @@ def find_duplicates(directories: Iterable[Path], *, show_progress: bool = False)
             continue
         by_size[size].append(path)
         progress.update()
+        if on_progress:
+            on_progress("Scanning", progress.count, None)
     progress.close()
     logger.info("Stage 1/3 done: %d files, %d distinct sizes", progress.count, len(by_size))
 
@@ -131,6 +145,8 @@ def find_duplicates(directories: Iterable[Path], *, show_progress: bool = False)
                 continue
             by_partial[(size, partial)].append(path)
             progress.update()
+            if on_progress:
+                on_progress("Quick hash", progress.count, partial_total)
     progress.close()
 
     full_candidates = [p for p in by_partial.values() if len(p) >= 2]
@@ -150,6 +166,8 @@ def find_duplicates(directories: Iterable[Path], *, show_progress: bool = False)
                 continue
             by_full[full].append(path)
             progress.update()
+            if on_progress:
+                on_progress("Full hash", progress.count, full_total)
     progress.close()
 
     groups = [
