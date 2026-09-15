@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,25 +17,43 @@ logger = logging.getLogger(__name__)
 
 
 def iter_files(directories: Iterable[Path]) -> Iterator[Path]:
+    """Recursively yield every file under `directories`, following directory
+    symlinks (e.g. an iCloud/Dropbox-synced folder, or a dotfiles symlink)
+    but never re-entering a real directory already visited -- which both
+    prevents symlink-cycle hangs and avoids the same file being reported
+    twice through two different symlinked paths.
+
+    File symlinks are skipped: a symlink to a file elsewhere isn't a real
+    duplicate on disk, it's the same file, so counting it as a "copy" would
+    be misleading.
+    """
+    visited: set[tuple[int, int]] = set()
     for directory in directories:
+        yield from _walk(directory, visited)
+
+
+def _walk(directory: Path, visited: set[tuple[int, int]]) -> Iterator[Path]:
+    try:
+        st = os.stat(directory)
+        key = (st.st_dev, st.st_ino)
+        if key in visited:
+            return
+        visited.add(key)
+        entries = list(os.scandir(directory))
+    except OSError:
+        return
+
+    for entry in entries:
         try:
-            entries = directory.rglob("*")
+            is_symlink = entry.is_symlink()
+            if is_symlink and not entry.is_dir(follow_symlinks=True):
+                continue
+            if entry.is_dir(follow_symlinks=True):
+                yield from _walk(Path(entry.path), visited)
+            elif not is_symlink and entry.is_file(follow_symlinks=False):
+                yield Path(entry.path)
         except OSError:
             continue
-        while True:
-            try:
-                path = next(entries)
-            except StopIteration:
-                break
-            except OSError:
-                continue
-            if path.is_symlink():
-                continue
-            try:
-                if path.is_file():
-                    yield path
-            except OSError:
-                continue
 
 
 def _partial_hash(path: Path) -> str:

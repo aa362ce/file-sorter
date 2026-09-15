@@ -35,10 +35,13 @@ Or as a module, without installing:
 python -m file_sorter ~/Downloads ~/Desktop
 ```
 
-Each directory is scanned recursively. Output groups files that are exact
-duplicates (by content), along with total reclaimable space. Unreadable
-files (permission-protected, removed mid-scan) are skipped and reported
-rather than aborting the scan.
+Each directory is scanned recursively, including into symlinked
+directories (e.g. an iCloud/Dropbox-synced folder) -- symlink cycles are
+detected and safely skipped. Symlinked *files* are not followed, since a
+symlink to a file elsewhere isn't a real duplicate on disk. Output groups
+files that are exact duplicates (by content), along with total
+reclaimable space. Unreadable files (permission-protected, removed
+mid-scan) are skipped and reported rather than aborting the scan.
 
 ### Progress and logging
 
