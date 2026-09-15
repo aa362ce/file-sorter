@@ -46,26 +46,30 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         directories.append(path)
 
-    groups = find_duplicates(directories)
+    result = find_duplicates(directories)
+    groups = result.groups
     if args.min_size:
         groups = [g for g in groups if g.size >= args.min_size]
 
     if not groups:
         print("No duplicates found.")
-        return 0
+    else:
+        total_wasted = 0
+        for group in groups:
+            wasted = group.size * (len(group.paths) - 1)
+            total_wasted += wasted
+            print(
+                f"\n{len(group.paths)} copies, {_human_size(group.size)} each "
+                f"(sha256 {group.file_hash[:12]}...):"
+            )
+            for path in group.paths:
+                print(f"  {path}")
 
-    total_wasted = 0
-    for group in groups:
-        wasted = group.size * (len(group.paths) - 1)
-        total_wasted += wasted
-        print(
-            f"\n{len(group.paths)} copies, {_human_size(group.size)} each "
-            f"(sha256 {group.file_hash[:12]}...):"
-        )
-        for path in group.paths:
-            print(f"  {path}")
+        print(f"\n{len(groups)} duplicate group(s), {_human_size(total_wasted)} reclaimable.")
 
-    print(f"\n{len(groups)} duplicate group(s), {_human_size(total_wasted)} reclaimable.")
+    if result.skipped:
+        print(f"\nSkipped {len(result.skipped)} unreadable file(s) (permission denied or removed).")
+
     return 0
 
 
