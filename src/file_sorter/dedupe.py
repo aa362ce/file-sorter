@@ -23,6 +23,8 @@ K = TypeVar("K")
 
 logger = logging.getLogger(__name__)
 
+_HAS_FILE_DIGEST = hasattr(hashlib, "file_digest")  # Python 3.11+
+
 
 def default_workers() -> int:
     """Worker count used when the caller doesn't request a specific one."""
@@ -75,10 +77,19 @@ def _partial_hash(path: Path) -> str:
 
 
 def _full_hash(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(FULL_READ_CHUNK_SIZE), b""):
-            digest.update(chunk)
+        if _HAS_FILE_DIGEST:
+            # C-level loop (readinto + incremental update) -- avoids the
+            # per-chunk bytes allocation and Python loop overhead below.
+            return hashlib.file_digest(f, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        buf = bytearray(FULL_READ_CHUNK_SIZE)
+        view = memoryview(buf)
+        while True:
+            n = f.readinto(buf)
+            if not n:
+                break
+            digest.update(view[:n])
     return digest.hexdigest()
 
 
@@ -357,8 +368,15 @@ def find_duplicates(
             cancelled = True
             cancelled_stage = "full_hash"
 
+    # Every path in by_full first passed through by_partial, keyed by
+    # (size, partial_hash) -- reuse that already-known size instead of an
+    # extra stat() per group (which could also raise if the file has since
+    # been removed).
+    size_by_path: dict[Path, int] = {
+        path: size for (size, _partial_digest), paths in by_partial.items() for path in paths
+    }
     groups = [
-        DuplicateGroup(file_hash=file_hash, size=paths[0].stat().st_size, paths=paths)
+        DuplicateGroup(file_hash=file_hash, size=size_by_path[paths[0]], paths=paths)
         for file_hash, paths in by_full.items()
         if len(paths) > 1
     ]
