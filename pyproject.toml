@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "file-sorter"
+version = "0.1.0"
+description = "Finds duplicate files across directories"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Ashish" }]
+
+[project.scripts]
+file-sorter = "file_sorter.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/file_sorter"]
