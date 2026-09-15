@@ -36,4 +36,18 @@ python -m file_sorter ~/Downloads ~/Desktop
 ```
 
 Each directory is scanned recursively. Output groups files that are exact
-duplicates (by content), along with total reclaimable space.
+duplicates (by content), along with total reclaimable space. Unreadable
+files (permission-protected, removed mid-scan) are skipped and reported
+rather than aborting the scan.
+
+### Progress and logging
+
+A live progress line (files scanned, then quick-hash and full-hash
+progress) is shown on stderr by default — pass `-q`/`--quiet` to suppress
+it. Use `-v` for stage-level info logs, or `-vv` for per-file debug logs
+(e.g. which files were skipped and why):
+
+```bash
+file-sorter ~ -v
+file-sorter ~ -q
+```

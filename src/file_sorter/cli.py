@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
 from pathlib import Path
 
 from .dedupe import find_duplicates
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,6 +27,19 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="BYTES",
         help="Ignore files smaller than this many bytes (default: 0)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase log verbosity (-v for stage info, -vv for per-file debug logs)",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress the live progress display",
+    )
     return parser
 
 
@@ -38,6 +55,13 @@ def _human_size(n: float) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    log_level = logging.WARNING
+    if args.verbose == 1:
+        log_level = logging.INFO
+    elif args.verbose >= 2:
+        log_level = logging.DEBUG
+    logging.basicConfig(level=log_level, format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+
     directories = []
     for raw in args.directories:
         path = Path(raw).expanduser().resolve()
@@ -46,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         directories.append(path)
 
-    result = find_duplicates(directories)
+    result = find_duplicates(directories, show_progress=not args.quiet)
     groups = result.groups
     if args.min_size:
         groups = [g for g in groups if g.size >= args.min_size]
