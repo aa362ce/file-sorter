@@ -16,12 +16,16 @@ class ResumeState:
 
     `stage` is the stage that was in progress when the scan was cancelled:
     "scanning" (stage 1, walking directories), "quick_hash" (stage 2,
-    partial hashing) or "full_hash" (stage 3, full hashing). `by_size` /
-    `by_partial` / `by_full` hold whatever results that stage (and any
-    earlier stage) had already produced, keyed as strings since JSON object
-    keys can't be ints or tuples. `processed` lists the files already
-    handled within the interrupted stage, so a resume only re-does the
-    remainder of that stage's candidates.
+    partial hashing) or "full_hash" (stage 3, confirming duplicates by
+    content). `by_size` / `by_partial` / `by_full` hold whatever results
+    that stage (and any earlier stage) had already produced, keyed as
+    strings since JSON object keys can't be ints or tuples. `processed`
+    lists the files already handled within the interrupted stage -- for a
+    "quick_hash" resume this is used precisely, to skip re-hashing those
+    files; for a "full_hash" resume, whether a *bucket* (not individual
+    file) can be skipped is instead derived from `by_full`, since
+    content-comparison confirmation isn't resumable at individual-file
+    granularity the way independent hashing was.
     """
 
     directories: list[str]

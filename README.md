@@ -9,12 +9,17 @@ file to every other file:
    can't have a duplicate and are dropped.
 2. **Partial hash** — for files sharing a size, hash just the first 8KB.
    Cheap, and filters out almost everything that isn't a real duplicate.
-3. **Full hash** — only files that still match on size *and* partial hash
-   get fully hashed (SHA-256) to confirm they're byte-for-byte identical.
+3. **Confirm** — files that still match on size *and* partial hash are
+   confirmed byte-for-byte identical by comparing their content directly
+   (not by hashing each one fully and comparing digests), reading only as
+   far as the first difference for files that turn out not to match. A
+   confirmed group is identified by a SHA-256 hash of one of its files,
+   computed once per group rather than once per candidate.
 
-The partial- and full-hashing stages hash multiple files at once across a
-thread pool, defaulting to one thread per CPU core. Override the count with
-`-j`/`--threads` (e.g. `--threads 1` to hash sequentially).
+The partial-hash and confirmation stages process multiple files at once
+across a thread pool, defaulting to one thread per CPU core. Override the
+count with `-j`/`--threads` (e.g. `--threads 1` to hash/compare
+sequentially).
 
 ## Setup
 
