@@ -12,6 +12,7 @@ from pathlib import Path
 from send2trash import send2trash
 
 from .dedupe import LARGE_FILE_THRESHOLD, DuplicateGroup, default_workers, files_equal, find_duplicates
+from .folders import FolderGroup
 from .formatting import human_size
 from .history import export_history, import_history, load_history, record_run
 from .resume import clear_resume_state, load_resume_state, save_resume_state
@@ -73,12 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--delete",
         action="store_true",
         help=(
-            "Delete duplicates after scanning -- keeps the first file in each group and "
+            "Delete duplicates after scanning -- keeps the first copy in each group and "
             "moves the rest to the Trash (via send2trash, never permanently deleted), same "
-            "convention as the GUI. A large-file group not verified during the scan is "
-            "compared against its kept file right before deletion, and skipped (with a "
-            "warning, nothing deleted) if it doesn't actually match. Prompts for "
-            "confirmation unless -y/--yes is given."
+            "convention as the GUI. A confirmed duplicate folder is deleted as a single unit "
+            "(its files are skipped individually below); a large-file group not verified "
+            "during the scan is compared against its kept file right before deletion, and "
+            "skipped (with a warning, nothing deleted) if it doesn't actually match. Prompts "
+            "for confirmation unless -y/--yes is given."
         ),
     )
     parser.add_argument(
@@ -240,7 +242,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {path}")
         print(
             f"\n{len(folder_groups)} duplicate folder(s) found -- their files are also listed "
-            "individually below, and --delete handles them at the file level."
+            "individually below. --delete removes a confirmed one as a single unit; an "
+            "unverified (large-file) one is handled file by file instead."
         )
 
     groups = result.groups
@@ -279,32 +282,80 @@ def main(argv: list[str] | None = None) -> int:
     if result.cancelled and result.resume_state is not None:
         print("\nRun 'file-sorter --resume' to continue this scan where it left off.")
 
-    if args.delete and groups:
-        _delete_duplicates(groups, skip_confirmation=args.yes, dry_run=args.dry_run)
+    if args.delete and (groups or result.folder_groups):
+        _delete_duplicates(groups, result.folder_groups, skip_confirmation=args.yes, dry_run=args.dry_run)
 
     return 0
 
 
-def _delete_duplicates(groups: list[DuplicateGroup], *, skip_confirmation: bool, dry_run: bool = False) -> None:
-    # Same convention as the GUI: keep the first file in each group, delete the rest.
-    to_delete = [(group, path) for group in groups for path in group.paths[1:]]
-    if not to_delete:
+def _delete_duplicates(
+    groups: list[DuplicateGroup],
+    folder_groups: list[FolderGroup],
+    *,
+    skip_confirmation: bool,
+    dry_run: bool = False,
+) -> None:
+    # Only a *confirmed* folder group can be deleted as a single unit --
+    # every file inside one was already individually confirmed, so trashing
+    # the whole directory needs no further verification. An unconfirmed
+    # (deferred, large-file) folder group is left alone here entirely; its
+    # files fall through to the per-file plan below, which already
+    # verifies each one before deleting it.
+    folders_to_delete = [(fg, path) for fg in folder_groups if fg.confirmed for path in fg.paths[1:]]
+    delete_dirs = [path for _fg, path in folders_to_delete]
+
+    def under_any(path: Path, roots: list[Path]) -> bool:
+        return any(path.is_relative_to(root) for root in roots)
+
+    # Same convention as the GUI: keep the first file in each group, delete
+    # the rest -- but a file's own group.paths[0] pick is independent of
+    # which *folder* copy is being kept, so re-derive "keep/delete" among
+    # only the paths NOT already covered by a folder-level deletion above,
+    # rather than blindly trusting group.paths[0]/[1:]. Otherwise a file
+    # whose file-level "kept" copy happens to sit in a folder being
+    # bulk-deleted could end up with every copy removed.
+    files_to_delete: list[tuple[DuplicateGroup, Path]] = []
+    for group in groups:
+        remaining = [p for p in group.paths if not under_any(p, delete_dirs)]
+        if len(remaining) < 2:
+            continue  # already fully handled by a folder-level deletion, or only one copy is left
+        files_to_delete.extend((group, path) for path in remaining[1:])
+
+    if not folders_to_delete and not files_to_delete:
         return
 
     if dry_run:
         print("\nDry run -- nothing will actually be deleted.")
     elif not skip_confirmation:
+        parts = []
+        if folders_to_delete:
+            parts.append(f"{len(folders_to_delete)} folder(s)")
+        if files_to_delete:
+            parts.append(f"{len(files_to_delete)} file(s)")
         try:
-            answer = input(f"\nMove {len(to_delete)} file(s) to Trash? [y/N] ").strip().lower()
+            answer = input(f"\nMove {' and '.join(parts)} to Trash? [y/N] ").strip().lower()
         except EOFError:
             answer = "n"
         if answer not in ("y", "yes"):
-            print("Aborted -- no files deleted.")
+            print("Aborted -- nothing deleted.")
             return
 
-    deleted = 0
+    deleted_folders = 0
+    deleted_files = 0
     failures = []
-    for group, path in to_delete:
+
+    for _fg, path in folders_to_delete:
+        if dry_run:
+            print(f"  would delete folder: {path}")
+            deleted_folders += 1
+            continue
+        try:
+            send2trash(str(path))
+            deleted_folders += 1
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+
+    for group, path in files_to_delete:
         if not group.confirmed:
             try:
                 verified = files_equal(group.paths[0], path)
@@ -320,19 +371,19 @@ def _delete_duplicates(groups: list[DuplicateGroup], *, skip_confirmation: bool,
                 continue
         if dry_run:
             print(f"  would delete: {path}")
-            deleted += 1
+            deleted_files += 1
             continue
         try:
             send2trash(str(path))
-            deleted += 1
+            deleted_files += 1
         except OSError as exc:
             failures.append(f"{path}: {exc}")
 
     verb = "Would delete" if dry_run else "Deleted"
-    print(f"\n{verb} {deleted} file(s) to Trash.")
+    print(f"\n{verb} {deleted_folders} folder(s) and {deleted_files} file(s) to Trash.")
     if failures:
         label = "would not be deleted" if dry_run else "were not deleted"
-        print(f"{len(failures)} file(s) {label}:")
+        print(f"{len(failures)} item(s) {label}:")
         for line in failures:
             print(f"  {line}")
 
