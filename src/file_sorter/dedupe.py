@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import logging
 import os
@@ -7,17 +8,31 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
 from .resume import ResumeState
+
+if TYPE_CHECKING:
+    from .folders import FolderGroup
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
+LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
+
+T = TypeVar("T")
+K = TypeVar("K")
 
 logger = logging.getLogger(__name__)
+
+_HAS_FILE_DIGEST = hasattr(hashlib, "file_digest")  # Python 3.11+
+
+
+def default_workers() -> int:
+    """Worker count used when the caller doesn't request a specific one."""
+    return os.cpu_count() or 1
 
 
 def iter_files(directories: Iterable[Path]) -> Iterator[Path]:
@@ -66,18 +81,232 @@ def _partial_hash(path: Path) -> str:
 
 
 def _full_hash(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(FULL_READ_CHUNK_SIZE), b""):
-            digest.update(chunk)
+        if _HAS_FILE_DIGEST:
+            # C-level loop (readinto + incremental update) -- avoids the
+            # per-chunk bytes allocation and Python loop overhead below.
+            return hashlib.file_digest(f, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        buf = bytearray(FULL_READ_CHUNK_SIZE)
+        view = memoryview(buf)
+        while True:
+            n = f.readinto(buf)
+            if not n:
+                break
+            digest.update(view[:n])
     return digest.hexdigest()
+
+
+def files_equal(path_a: Path, path_b: Path) -> bool:
+    """True if two files -- already known to be the same size -- are
+    byte-for-byte identical, comparing chunk by chunk with an early exit at
+    the first difference.
+
+    This is how tools like jdupes/rmlint confirm a match instead of hashing
+    both files fully and comparing digests: two files that differ early
+    (a common case for files that coincidentally share a size and a partial
+    hash, e.g. same header/format but different content) are ruled out
+    after reading only as far as the difference, rather than always reading
+    every byte of both.
+    """
+    with path_a.open("rb") as fa, path_b.open("rb") as fb:
+        while True:
+            chunk_a = fa.read(FULL_READ_CHUNK_SIZE)
+            chunk_b = fb.read(FULL_READ_CHUNK_SIZE)
+            if chunk_a != chunk_b:
+                return False
+            if not chunk_a:
+                return True
+
+
+def _group_by_content(
+    buckets: list[list[Path]],
+    *,
+    workers: int,
+    stage_label: str,
+    show_progress: bool,
+    on_progress: Optional[ProgressCallback],
+    is_cancelled: Callable[[], bool],
+) -> tuple[dict[str, list[Path]], list[Path], list[Path], bool]:
+    """Confirm which files within each bucket (files that already share a
+    size and a partial hash from earlier stages) are true duplicates, by
+    comparing their content directly instead of hashing every one of them.
+
+    Within a bucket, one file is picked as the "representative" and every
+    other file in the bucket is compared against it (concurrently, across a
+    thread pool of `workers` threads); matches join its group, non-matches
+    are set aside and the same process repeats among them (picking a new
+    representative) until none remain -- so a bucket with more than one
+    distinct file (a rare partial-hash coincidence) still ends up correctly
+    split into separate groups. A confirmed group's identifying hash is
+    computed from its representative only, once -- files that turn out not
+    to match anything are never hashed at all.
+    """
+    result: dict[str, list[Path]] = {}
+    processed: list[Path] = []
+    skipped: list[Path] = []
+    cancelled = False
+    total = sum(len(bucket) for bucket in buckets)
+    progress = Progress(stage_label, total=total, enabled=show_progress)
+
+    def mark_done(path: Path) -> None:
+        processed.append(path)
+        progress.update()
+        if on_progress:
+            on_progress(stage_label, progress.count, total)
+
+    def compare(representative: Path, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
+        try:
+            return other, files_equal(representative, other), None
+        except OSError as exc:
+            return other, None, exc
+
+    def record_group(representative: Path, matched_others: list[Path]) -> None:
+        if not matched_others:
+            return
+        digest = _full_hash(representative)
+        result.setdefault(digest, []).extend([representative] + matched_others)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        for bucket in buckets:
+            if cancelled:
+                break
+            remaining = list(bucket)
+            while len(remaining) >= 2:
+                if is_cancelled():
+                    cancelled = True
+                    break
+                representative, *rest = remaining
+                try:
+                    with representative.open("rb"):
+                        pass
+                except OSError as exc:
+                    logger.debug("Skipping unreadable file %s: %s", representative, exc)
+                    skipped.append(representative)
+                    mark_done(representative)
+                    remaining = rest
+                    continue
+
+                mark_done(representative)
+                leftover: list[Path] = []
+                matched_others: list[Path] = []
+                comparisons = (
+                    pool.map(lambda p: compare(representative, p), rest)
+                    if pool is not None
+                    else (compare(representative, p) for p in rest)
+                )
+                for other, is_equal, err in comparisons:
+                    if err is not None:
+                        logger.debug("Skipping unreadable file %s: %s", other, err)
+                        skipped.append(other)
+                    elif is_equal:
+                        matched_others.append(other)
+                    else:
+                        leftover.append(other)
+                    mark_done(other)
+                record_group(representative, matched_others)
+                remaining = leftover
+            if not cancelled and len(remaining) == 1:
+                mark_done(remaining[0])
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+    progress.close()
+    return result, processed, skipped, cancelled
+
+
+def _hash_parallel(
+    items: list[T],
+    *,
+    path_of: Callable[[T], Path],
+    hash_fn: Callable[[Path], str],
+    key_of: Callable[[T, str], K],
+    workers: int,
+    stage_label: str,
+    show_progress: bool,
+    on_progress: Optional[ProgressCallback],
+    is_cancelled: Callable[[], bool],
+) -> tuple[dict[K, list[Path]], list[Path], list[Path], bool]:
+    """Hash `items` into buckets keyed by `key_of`, spreading the reads and
+    hashing across a thread pool of `workers` threads.
+
+    Hashing is a mix of file I/O (which releases the GIL while waiting on
+    the OS) and CPU work in hashlib's C implementation (which also releases
+    the GIL for each chunk), so multiple files can genuinely be read and
+    hashed at the same time instead of one at a time -- `workers` should
+    typically track the number of CPU cores available.
+
+    Cancellation is checked once per batch of `workers` files rather than
+    between every single file, since a whole batch is already in flight
+    together by the time it could be checked; whatever a batch finishes is
+    kept before stopping.
+    """
+    result: dict[K, list[Path]] = defaultdict(list)
+    processed: list[Path] = []
+    skipped: list[Path] = []
+    cancelled = False
+    total = len(items)
+    progress = Progress(stage_label, total=total, enabled=show_progress)
+
+    def record(item: T, digest: Optional[str], error: Optional[OSError]) -> None:
+        path = path_of(item)
+        if error is not None:
+            logger.debug("Skipping unreadable file %s: %s", path, error)
+            skipped.append(path)
+            processed.append(path)
+            return
+        assert digest is not None
+        result[key_of(item, digest)].append(path)
+        processed.append(path)
+        progress.update()
+        if on_progress:
+            on_progress(stage_label, progress.count, total)
+
+    if workers <= 1 or total <= 1:
+        for item in items:
+            if is_cancelled():
+                cancelled = True
+                break
+            try:
+                record(item, hash_fn(path_of(item)), None)
+            except OSError as exc:
+                record(item, None, exc)
+        progress.close()
+        return result, processed, skipped, cancelled
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        index = 0
+        while index < total:
+            if is_cancelled():
+                cancelled = True
+                break
+            batch = items[index : index + workers]
+            futures = [(item, pool.submit(hash_fn, path_of(item))) for item in batch]
+            for item, future in futures:
+                try:
+                    record(item, future.result(), None)
+                except OSError as exc:
+                    record(item, None, exc)
+            index += len(batch)
+    progress.close()
+    return result, processed, skipped, cancelled
 
 
 @dataclass
 class DuplicateGroup:
+    """`confirmed` is False for a very-large-file group whose members are
+    only known to share a size and partial hash -- full confirmation (a
+    direct content comparison) was deferred rather than paying its cost
+    during the scan, and happens instead right before a file from the
+    group is actually deleted. `file_hash` for such a group is a
+    "size:partial_hash" string (see `_partial_key`), not a SHA-256 digest.
+    """
+
     file_hash: str
     size: int
     paths: list[Path] = field(default_factory=list)
+    confirmed: bool = True
 
 
 @dataclass
@@ -86,6 +315,7 @@ class ScanResult:
     skipped: list[Path]
     cancelled: bool = False
     resume_state: Optional[ResumeState] = None
+    folder_groups: list["FolderGroup"] = field(default_factory=list)
 
 
 def _partial_key(size: int, partial_hash: str) -> str:
@@ -99,17 +329,27 @@ def find_duplicates(
     on_progress: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
     resume_state: Optional[ResumeState] = None,
+    workers: Optional[int] = None,
+    large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
     Each stage is a dict keyed by an increasingly expensive signature, and
     only buckets with 2+ files carry forward -- most files drop out after
-    the free `stat()` call, so full-file hashing only happens for files
-    that already share a size and a few KB of leading bytes.
+    the free `stat()` call, so stage 3 only has to look at files that
+    already share a size and a few KB of leading bytes.
 
     Stage 1 (size):          dict[int, list[Path]]
     Stage 2 (size + partial): dict[(int, str), list[Path]]
-    Stage 3 (full hash):      dict[str, list[Path]]
+    Stage 3 (confirm):        dict[str, list[Path]]
+
+    Stage 3 confirms matches by comparing file content directly (see
+    `_group_by_content`) rather than hashing every remaining candidate and
+    comparing digests -- a pair that differs early is ruled out as soon as
+    the difference is found, and a file with no match is never hashed at
+    all. Each confirmed group's dict key is still a SHA-256 hash, computed
+    once from one file in the group (its "representative"), so the result
+    shape and the CLI/GUI's use of it as a display digest are unchanged.
 
     Files that can't be read (permission-protected, removed mid-scan, ...)
     are skipped rather than aborting the whole scan.
@@ -132,15 +372,38 @@ def find_duplicates(
     `resume_state`, if given, must describe a scan that was cancelled
     partway through stage 2 or 3 (`stage` "quick_hash" or "full_hash") --
     the results already computed for the interrupted stage and any earlier
-    stage are reused, and only the files not yet processed at cancellation
-    time are (re)hashed. A `resume_state` with `stage` "scanning" (cancelled
+    stage are reused. For stage 2, only the files not yet processed at
+    cancellation time are (re)hashed. For stage 3, whole buckets (groups of
+    files sharing a size and partial hash) that were already fully
+    confirmed are skipped, but a bucket that was only partly resolved when
+    cancelled is redone from scratch rather than resumed file-by-file --
+    representative-based comparison doesn't carry over mid-bucket the way
+    independent per-file hashing did, and buckets are small enough that
+    this costs little. A `resume_state` with `stage` "scanning" (cancelled
     during the directory walk, which has nothing worth resuming) is
     equivalent to passing none.
+
+    `workers` controls how many files stages 2 and 3 (the actual hashing)
+    process concurrently via a thread pool, to take advantage of multiple
+    CPU cores/threads instead of hashing one file at a time. Defaults to
+    `os.cpu_count()`; pass 1 to hash sequentially.
+
+    `large_file_threshold` (bytes) controls stage 3's cutoff for deferring
+    confirmation: a bucket of candidates at or above this size is reported
+    as a single unconfirmed `DuplicateGroup` (`confirmed=False`) without
+    ever being compared, instead of paying the I/O cost of comparing
+    potentially huge files during the scan itself -- especially wasteful
+    for files the user might not even choose to delete. The caller is
+    expected to confirm such a group itself (e.g. with `files_equal`)
+    right before actually deleting one of its files. Pass 0/None to
+    disable deferral and always confirm during the scan, regardless of
+    size. Defaults to `LARGE_FILE_THRESHOLD` (500MB).
     """
     directories = list(directories)
     skipped: list[Path] = []
     cancelled = False
     cancelled_stage: Optional[str] = None
+    workers = workers if workers and workers > 0 else default_workers()
 
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -206,74 +469,107 @@ def find_duplicates(
             else:
                 logger.info("Stage 2/3: quick-hashing %d candidate file(s)", len(partial_candidates))
 
-        partial_total = len(partial_candidates)
-        progress = Progress("Quick hash", total=partial_total, enabled=show_progress)
-        for size, path in partial_candidates:
-            if is_cancelled():
-                cancelled = True
-                cancelled_stage = "quick_hash"
-                break
-            try:
-                partial = _partial_hash(path)
-            except OSError as exc:
-                logger.debug("Skipping unreadable file %s: %s", path, exc)
-                skipped.append(path)
-                processed_stage2.append(path)
-                continue
-            by_partial[(size, partial)].append(path)
-            processed_stage2.append(path)
-            progress.update()
-            if on_progress:
-                on_progress("Quick hash", progress.count, partial_total)
-        progress.close()
+        hashed, processed_stage2, newly_skipped, stage_cancelled = _hash_parallel(
+            partial_candidates,
+            path_of=lambda item: item[1],
+            hash_fn=_partial_hash,
+            key_of=lambda item, digest: (item[0], digest),
+            workers=workers,
+            stage_label="Quick hash",
+            show_progress=show_progress,
+            on_progress=on_progress,
+            is_cancelled=is_cancelled,
+        )
+        for key, paths in hashed.items():
+            by_partial[key].extend(paths)
+        skipped.extend(newly_skipped)
+        if stage_cancelled:
+            cancelled = True
+            cancelled_stage = "quick_hash"
 
     by_full: dict[str, list[Path]] = defaultdict(list)
     processed_stage3: list[Path] = []
+    deferred_groups: list[DuplicateGroup] = []
     if not cancelled:
-        already_processed = set()
+        resolved_paths: set[Path] = set()
         if resume_stage == "full_hash":
             assert resume_state is not None
             for full_hash, paths in resume_state.by_full.items():
                 by_full[full_hash] = [Path(p) for p in paths]
-            already_processed = {Path(p) for p in resume_state.processed}
+            resolved_paths = {Path(p) for group in resume_state.by_full.values() for p in group}
 
-        full_candidates = [
-            path
-            for paths in by_partial.values()
-            if len(paths) >= 2
-            for path in paths
-            if path not in already_processed
-        ]
-        full_total = len(full_candidates)
+        # Split each (size, partial_hash) bucket into buckets to actually
+        # compare now versus very-large-file buckets whose confirmation is
+        # deferred until deletion time (see `large_file_threshold` above).
+        buckets: list[list[Path]] = []
+        for (size, partial_digest), paths in by_partial.items():
+            if len(paths) < 2:
+                continue
+            bucket_set = set(paths)
+            if resume_stage == "full_hash":
+                # A bucket is only skippable if every one of its members is
+                # already accounted for in a confirmed group; a bucket that
+                # was only partly resolved when the scan was cancelled is
+                # redone from scratch (representative comparisons aren't
+                # resumable at file granularity the way independent hashing
+                # was), so drop whatever partial group it had contributed
+                # to avoid double counting those members once it's redone.
+                if bucket_set <= resolved_paths:
+                    continue
+                for key in [k for k, v in by_full.items() if bucket_set & set(v)]:
+                    del by_full[key]
+            if large_file_threshold and size >= large_file_threshold:
+                deferred_groups.append(
+                    DuplicateGroup(
+                        file_hash=_partial_key(size, partial_digest),
+                        size=size,
+                        paths=list(paths),
+                        confirmed=False,
+                    )
+                )
+            else:
+                buckets.append(paths)
+
+        full_total = sum(len(b) for b in buckets)
         if resume_stage == "full_hash":
             logger.info("Resuming stage 3/3: %d candidate file(s) remaining", full_total)
+        elif deferred_groups:
+            logger.info(
+                "Stage 3/3: confirming %d candidate file(s) by content "
+                "(%d file(s) in %d large-file group(s) deferred until deletion)",
+                full_total,
+                sum(len(g.paths) for g in deferred_groups),
+                len(deferred_groups),
+            )
         else:
-            logger.info("Stage 3/3: full-hashing %d candidate file(s)", full_total)
-        progress = Progress("Full hash", total=full_total, enabled=show_progress)
-        for path in full_candidates:
-            if is_cancelled():
-                cancelled = True
-                cancelled_stage = "full_hash"
-                break
-            try:
-                full = _full_hash(path)
-            except OSError as exc:
-                logger.debug("Skipping unreadable file %s: %s", path, exc)
-                skipped.append(path)
-                processed_stage3.append(path)
-                continue
-            by_full[full].append(path)
-            processed_stage3.append(path)
-            progress.update()
-            if on_progress:
-                on_progress("Full hash", progress.count, full_total)
-        progress.close()
+            logger.info("Stage 3/3: confirming %d candidate file(s) by content", full_total)
+        hashed, processed_stage3, newly_skipped, stage_cancelled = _group_by_content(
+            buckets,
+            workers=workers,
+            stage_label="Confirm duplicates",
+            show_progress=show_progress,
+            on_progress=on_progress,
+            is_cancelled=is_cancelled,
+        )
+        for key, paths in hashed.items():
+            by_full[key].extend(paths)
+        skipped.extend(newly_skipped)
+        if stage_cancelled:
+            cancelled = True
+            cancelled_stage = "full_hash"
 
+    # Every path in by_full first passed through by_partial, keyed by
+    # (size, partial_hash) -- reuse that already-known size instead of an
+    # extra stat() per group (which could also raise if the file has since
+    # been removed).
+    size_by_path: dict[Path, int] = {
+        path: size for (size, _partial_digest), paths in by_partial.items() for path in paths
+    }
     groups = [
-        DuplicateGroup(file_hash=file_hash, size=paths[0].stat().st_size, paths=paths)
+        DuplicateGroup(file_hash=file_hash, size=size_by_path[paths[0]], paths=paths)
         for file_hash, paths in by_full.items()
         if len(paths) > 1
-    ]
+    ] + deferred_groups
     groups.sort(key=lambda g: g.size * len(g.paths), reverse=True)
 
     new_resume_state: Optional[ResumeState] = None
@@ -298,4 +594,23 @@ def find_duplicates(
     else:
         logger.info("Done: %d duplicate group(s), %d file(s) skipped", len(groups), len(skipped))
 
-    return ScanResult(groups=groups, skipped=skipped, cancelled=cancelled, resume_state=new_resume_state)
+    folder_groups: list["FolderGroup"] = []
+    if not cancelled:
+        # Only meaningful for a complete scan -- a cancelled one hasn't
+        # finished confirming every candidate, so a directory could look
+        # "fully accounted for" purely because its remaining files weren't
+        # reached yet, not because they're actually unique.
+        from .folders import find_duplicate_folders
+
+        all_files = [p for paths in by_size.values() for p in paths]
+        folder_groups = find_duplicate_folders(all_files, skipped, groups, directories)
+        if folder_groups:
+            logger.info("Found %d duplicate folder(s)", len(folder_groups))
+
+    return ScanResult(
+        groups=groups,
+        skipped=skipped,
+        cancelled=cancelled,
+        resume_state=new_resume_state,
+        folder_groups=folder_groups,
+    )

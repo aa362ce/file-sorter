@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
-from ..dedupe import DuplicateGroup, ScanResult
+from ..dedupe import DuplicateGroup, ScanResult, files_equal
+from ..folders import FolderGroup
 from ..formatting import human_size
 from ..history import record_run
 from ..resume import ResumeState, clear_resume_state, load_resume_state, save_resume_state
@@ -172,8 +173,17 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
 
+        # Files inside a confirmed folder match are rendered informational
+        # (no checkbox) in their own file-level group below -- their fate
+        # is governed entirely by that folder's checkbox instead, since the
+        # two are computed independently and could otherwise disagree
+        # about which copy is "kept" for the very same file.
+        confirmed_folder_dirs = [d for fg in result.folder_groups if fg.confirmed for d in fg.paths]
+
+        for folder_group in result.folder_groups:
+            self._add_folder_group(folder_group)
         for group in result.groups:
-            self._add_group(group)
+            self._add_group(group, confirmed_folder_dirs)
 
         duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
         record_run(self._scan_directories, result, duration)
@@ -185,9 +195,12 @@ class MainWindow(QMainWindow):
             clear_resume_state()
             self.resume_btn.setEnabled(False)
 
+        folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
         cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
-        self.status_label.setText(f"{len(result.groups)} duplicate group(s) found{skipped_note}{cancelled_note}")
+        self.status_label.setText(
+            f"{len(result.groups)} duplicate group(s) found{folder_note}{skipped_note}{cancelled_note}"
+        )
         self.delete_btn.setEnabled(bool(result.groups))
         self._update_reclaimable_label()
         self._worker = None
@@ -197,15 +210,67 @@ class MainWindow(QMainWindow):
 
     # -- results tree -----------------------------------------------------
 
-    def _add_group(self, group: DuplicateGroup) -> None:
-        header = QTreeWidgetItem([f"{len(group.paths)} copies, {human_size(group.size)} each", ""])
+    def _add_folder_group(self, group: FolderGroup) -> None:
+        """A confirmed folder group is checkable, same "keep first, check
+        the rest" convention as `_add_group` -- checking a copy and
+        deleting it removes the whole directory in one action. An
+        unconfirmed (large-file) group is informational only: its files
+        still appear as regular, individually-deletable groups via
+        `_add_group`, since bulk-deleting an unverified folder isn't safe.
+        """
+        label = f"\U0001F4C1 Folder duplicate: {len(group.paths)} copies ({group.file_count} files, {human_size(group.size)} each)"
+        if not group.confirmed:
+            label += "  (unverified -- large file(s), handled at the file level instead)"
+        header = QTreeWidgetItem([label, ""])
+        if group.confirmed:
+            header.setData(0, Qt.ItemDataRole.UserRole, group)
+        else:
+            header.setFlags(header.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
         self.results_tree.addTopLevelItem(header)
         for index, path in enumerate(group.paths):
             child = QTreeWidgetItem([str(path), human_size(group.size)])
-            child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            child.setData(0, Qt.ItemDataRole.UserRole, (path, group.size))
-            # Default: keep the first copy, mark the rest for deletion.
-            child.setCheckState(0, Qt.CheckState.Unchecked if index == 0 else Qt.CheckState.Checked)
+            if group.confirmed:
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setData(0, Qt.ItemDataRole.UserRole, (path, group.size))
+                child.setCheckState(0, Qt.CheckState.Unchecked if index == 0 else Qt.CheckState.Checked)
+            else:
+                # No UserRole group data is set on `header` in this branch,
+                # so these rows must stay non-checkable -- _delete_checked()
+                # would crash trying to read a group off it otherwise.
+                child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            header.addChild(child)
+        header.setExpanded(True)
+
+    def _add_group(self, group: DuplicateGroup, confirmed_folder_dirs: Optional[list[Path]] = None) -> None:
+        confirmed_folder_dirs = confirmed_folder_dirs or []
+        label = f"{len(group.paths)} copies, {human_size(group.size)} each"
+        if not group.confirmed:
+            label += "  (unverified -- large file, checked before deletion)"
+        header = QTreeWidgetItem([label, ""])
+        header.setData(0, Qt.ItemDataRole.UserRole, group)
+        self.results_tree.addTopLevelItem(header)
+
+        def covered(path: Path) -> bool:
+            return any(path.is_relative_to(d) for d in confirmed_folder_dirs)
+
+        # Among files NOT covered by a confirmed folder match (handled
+        # below), the first one defaults to kept/unchecked -- not
+        # necessarily group.paths[0], since that could be a covered file.
+        first_uncovered = next((i for i, p in enumerate(group.paths) if not covered(p)), None)
+
+        for index, path in enumerate(group.paths):
+            child = QTreeWidgetItem([str(path), human_size(group.size)])
+            if covered(path):
+                # This copy's fate is decided by its folder's checkbox in
+                # the "Folder duplicate" entry above, not here -- deciding
+                # both independently risks disagreeing about which copy of
+                # this very file is the one being kept.
+                child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            else:
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setData(0, Qt.ItemDataRole.UserRole, (path, group.size))
+                # Default: keep the first (uncovered) copy, check the rest.
+                child.setCheckState(0, Qt.CheckState.Unchecked if index == first_uncovered else Qt.CheckState.Checked)
             header.addChild(child)
         header.setExpanded(True)
 
@@ -247,36 +312,130 @@ class MainWindow(QMainWindow):
 
     # -- deletion -----------------------------------------------------
 
+    def _kept_paths(self, group_item: QTreeWidgetItem) -> list[Path]:
+        """Paths under `group_item` currently unchecked (i.e. being kept),
+        used as references to verify an unconfirmed group's files against
+        right before deletion -- see `_add_group`/`DuplicateGroup.confirmed`.
+        """
+        kept = []
+        for i in range(group_item.childCount()):
+            child = group_item.child(i)
+            if child.checkState(0) == Qt.CheckState.Unchecked:
+                path, _size = child.data(0, Qt.ItemDataRole.UserRole)
+                kept.append(path)
+        return kept
+
+    def _remove_item(self, item: QTreeWidgetItem) -> None:
+        parent = item.parent()
+        parent.removeChild(item)
+        if parent.childCount() <= 1:
+            index = self.results_tree.indexOfTopLevelItem(parent)
+            self.results_tree.takeTopLevelItem(index)
+
     def _delete_checked(self) -> None:
-        items = self._checked_items()
-        if not items:
+        checked = self._checked_items()
+        if not checked:
             return
+
+        folder_items = []
+        file_items = []
+        for item in checked:
+            if isinstance(item.parent().data(0, Qt.ItemDataRole.UserRole), FolderGroup):
+                folder_items.append(item)
+            else:
+                file_items.append(item)
+
         confirm = QMessageBox.question(
             self,
             "Confirm deletion",
-            f"Move {len(items)} file(s) to Trash?",
+            f"Move {len(folder_items)} folder(s) and {len(file_items)} file(s) to Trash?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
+        # A file's own group might have its "kept" copy sitting in a
+        # folder that's about to be bulk-deleted (the per-file and
+        # per-folder "keep first, check rest" choices are independent) --
+        # so a file living anywhere under one of these folders must be
+        # left entirely to the folder-level deletion below, never
+        # individually deleted, or the only remaining copy could be lost.
+        delete_dirs = [item.data(0, Qt.ItemDataRole.UserRole)[0] for item in folder_items]
+
+        def under_any(path: Path, roots: list[Path]) -> bool:
+            return any(path.is_relative_to(root) for root in roots)
+
+        # A file-level group's own "kept" pick (index 0, unchecked) is
+        # computed independently of which folder copy is being kept, so a
+        # checked file could be the last surviving copy of its group once
+        # folder-level (and other checked file-level) deletions are
+        # applied. Guard against that generally: a file is only actually
+        # deleted if at least one other member of its group will still
+        # exist afterward.
+        checked_file_paths = {item.data(0, Qt.ItemDataRole.UserRole)[0] for item in file_items}
+
+        def has_survivor(group: DuplicateGroup, path: Path) -> bool:
+            return any(
+                p != path and not under_any(p, delete_dirs) and p not in checked_file_paths for p in group.paths
+            )
+
         failures = []
-        for item in items:
+
+        for item in folder_items:
             path, _size = item.data(0, Qt.ItemDataRole.UserRole)
             try:
                 send2trash(str(path))
             except OSError as exc:
                 failures.append(f"{path}: {exc}")
                 continue
-            group = item.parent()
-            group.removeChild(item)
-            if group.childCount() <= 1:
-                index = self.results_tree.indexOfTopLevelItem(group)
-                self.results_tree.takeTopLevelItem(index)
+            self._remove_item(item)
+
+        for item in file_items:
+            path, _size = item.data(0, Qt.ItemDataRole.UserRole)
+            if under_any(path, delete_dirs):
+                # Already handled by a folder-level deletion above.
+                self._remove_item(item)
+                continue
+
+            group_item = item.parent()
+            group: DuplicateGroup = group_item.data(0, Qt.ItemDataRole.UserRole)
+
+            if not has_survivor(group, path):
+                failures.append(
+                    f"{path}: deleting it would remove the last remaining copy of this file -- skipped"
+                )
+                continue
+
+            if not group.confirmed:
+                # Confirmation of this group was deferred during the scan
+                # (a very large file) -- do it now, against whichever
+                # file(s) in the group are being kept, before actually
+                # deleting anything.
+                verified = False
+                for reference in self._kept_paths(group_item):
+                    try:
+                        if files_equal(reference, path):
+                            verified = True
+                            break
+                    except OSError:
+                        continue
+                if not verified:
+                    failures.append(
+                        f"{path}: not verified as an actual duplicate of the kept file(s) -- "
+                        "skipped rather than risk deleting a non-duplicate"
+                    )
+                    continue
+
+            try:
+                send2trash(str(path))
+            except OSError as exc:
+                failures.append(f"{path}: {exc}")
+                continue
+            self._remove_item(item)
 
         self._update_reclaimable_label()
         if failures:
-            QMessageBox.warning(self, "Some files could not be deleted", "\n".join(failures))
+            QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
 
     # -- window lifecycle -----------------------------------------------
 
