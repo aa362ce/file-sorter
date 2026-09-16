@@ -121,11 +121,14 @@ def _walk_checkpointed(
             if is_symlink and not entry.is_dir(follow_symlinks=True):
                 continue
             if entry.is_dir(follow_symlinks=True):
-                # entry.stat() reuses the stat info scandir() already
-                # fetched for a real (non-symlink) subdirectory instead of
-                # issuing a second syscall for it -- a real cost at the
-                # scale of a whole drive's directory tree.
-                try_push(Path(entry.path), entry.stat())
+                # A real os.stat() call, not entry.stat() -- on Windows,
+                # DirEntry.stat() never populates st_dev/st_ino (they're
+                # always 0: https://docs.python.org/3/library/os.html#os.DirEntry.stat),
+                # so every subdirectory would collide on the same (0, 0)
+                # "identity" and try_push() would treat all but the first
+                # one as an already-visited cycle, silently pruning nearly
+                # the entire tree below the top level.
+                try_push(Path(entry.path), os.stat(entry.path))
             elif not is_symlink and entry.is_file(follow_symlinks=False):
                 path = Path(entry.path)
                 if path not in already_seen:
