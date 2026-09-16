@@ -17,6 +17,7 @@ ProgressCallback = Callable[[str, int, Optional[int]], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
+LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
 
 T = TypeVar("T")
 K = TypeVar("K")
@@ -93,7 +94,7 @@ def _full_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _files_equal(path_a: Path, path_b: Path) -> bool:
+def files_equal(path_a: Path, path_b: Path) -> bool:
     """True if two files -- already known to be the same size -- are
     byte-for-byte identical, comparing chunk by chunk with an early exit at
     the first difference.
@@ -153,7 +154,7 @@ def _group_by_content(
 
     def compare(representative: Path, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
         try:
-            return other, _files_equal(representative, other), None
+            return other, files_equal(representative, other), None
         except OSError as exc:
             return other, None, exc
 
@@ -291,9 +292,18 @@ def _hash_parallel(
 
 @dataclass
 class DuplicateGroup:
+    """`confirmed` is False for a very-large-file group whose members are
+    only known to share a size and partial hash -- full confirmation (a
+    direct content comparison) was deferred rather than paying its cost
+    during the scan, and happens instead right before a file from the
+    group is actually deleted. `file_hash` for such a group is a
+    "size:partial_hash" string (see `_partial_key`), not a SHA-256 digest.
+    """
+
     file_hash: str
     size: int
     paths: list[Path] = field(default_factory=list)
+    confirmed: bool = True
 
 
 @dataclass
@@ -316,6 +326,7 @@ def find_duplicates(
     cancel_event: Optional[threading.Event] = None,
     resume_state: Optional[ResumeState] = None,
     workers: Optional[int] = None,
+    large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -372,6 +383,17 @@ def find_duplicates(
     process concurrently via a thread pool, to take advantage of multiple
     CPU cores/threads instead of hashing one file at a time. Defaults to
     `os.cpu_count()`; pass 1 to hash sequentially.
+
+    `large_file_threshold` (bytes) controls stage 3's cutoff for deferring
+    confirmation: a bucket of candidates at or above this size is reported
+    as a single unconfirmed `DuplicateGroup` (`confirmed=False`) without
+    ever being compared, instead of paying the I/O cost of comparing
+    potentially huge files during the scan itself -- especially wasteful
+    for files the user might not even choose to delete. The caller is
+    expected to confirm such a group itself (e.g. with `files_equal`)
+    right before actually deleting one of its files. Pass 0/None to
+    disable deferral and always confirm during the scan, regardless of
+    size. Defaults to `LARGE_FILE_THRESHOLD` (500MB).
     """
     directories = list(directories)
     skipped: list[Path] = []
@@ -463,35 +485,58 @@ def find_duplicates(
 
     by_full: dict[str, list[Path]] = defaultdict(list)
     processed_stage3: list[Path] = []
+    deferred_groups: list[DuplicateGroup] = []
     if not cancelled:
+        resolved_paths: set[Path] = set()
         if resume_stage == "full_hash":
             assert resume_state is not None
             for full_hash, paths in resume_state.by_full.items():
                 by_full[full_hash] = [Path(p) for p in paths]
-            # A bucket is only skippable if every one of its members is
-            # already accounted for in a confirmed group; a bucket that was
-            # only partly resolved when the scan was cancelled is redone
-            # from scratch (representative comparisons aren't resumable at
-            # file granularity the way independent hashing was), so drop
-            # whatever partial group it had contributed to avoid double
-            # counting those members once it's redone below.
             resolved_paths = {Path(p) for group in resume_state.by_full.values() for p in group}
-            buckets = []
-            for paths in by_partial.values():
-                if len(paths) < 2:
-                    continue
-                bucket_set = set(paths)
+
+        # Split each (size, partial_hash) bucket into buckets to actually
+        # compare now versus very-large-file buckets whose confirmation is
+        # deferred until deletion time (see `large_file_threshold` above).
+        buckets: list[list[Path]] = []
+        for (size, partial_digest), paths in by_partial.items():
+            if len(paths) < 2:
+                continue
+            bucket_set = set(paths)
+            if resume_stage == "full_hash":
+                # A bucket is only skippable if every one of its members is
+                # already accounted for in a confirmed group; a bucket that
+                # was only partly resolved when the scan was cancelled is
+                # redone from scratch (representative comparisons aren't
+                # resumable at file granularity the way independent hashing
+                # was), so drop whatever partial group it had contributed
+                # to avoid double counting those members once it's redone.
                 if bucket_set <= resolved_paths:
                     continue
                 for key in [k for k, v in by_full.items() if bucket_set & set(v)]:
                     del by_full[key]
+            if large_file_threshold and size >= large_file_threshold:
+                deferred_groups.append(
+                    DuplicateGroup(
+                        file_hash=_partial_key(size, partial_digest),
+                        size=size,
+                        paths=list(paths),
+                        confirmed=False,
+                    )
+                )
+            else:
                 buckets.append(paths)
-        else:
-            buckets = [paths for paths in by_partial.values() if len(paths) >= 2]
 
         full_total = sum(len(b) for b in buckets)
         if resume_stage == "full_hash":
             logger.info("Resuming stage 3/3: %d candidate file(s) remaining", full_total)
+        elif deferred_groups:
+            logger.info(
+                "Stage 3/3: confirming %d candidate file(s) by content "
+                "(%d file(s) in %d large-file group(s) deferred until deletion)",
+                full_total,
+                sum(len(g.paths) for g in deferred_groups),
+                len(deferred_groups),
+            )
         else:
             logger.info("Stage 3/3: confirming %d candidate file(s) by content", full_total)
         hashed, processed_stage3, newly_skipped, stage_cancelled = _group_by_content(
@@ -520,7 +565,7 @@ def find_duplicates(
         DuplicateGroup(file_hash=file_hash, size=size_by_path[paths[0]], paths=paths)
         for file_hash, paths in by_full.items()
         if len(paths) > 1
-    ]
+    ] + deferred_groups
     groups.sort(key=lambda g: g.size * len(g.paths), reverse=True)
 
     new_resume_state: Optional[ResumeState] = None

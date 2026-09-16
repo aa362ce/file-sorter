@@ -21,6 +21,14 @@ across a thread pool, defaulting to one thread per CPU core. Override the
 count with `-j`/`--threads` (e.g. `--threads 1` to hash/compare
 sequentially).
 
+Very large files (500MB+ by default) skip the confirm step during the scan
+entirely -- comparing multi-gigabyte files is expensive, and wasted work if
+they're never actually deleted. Such a group is reported as unverified
+(matched by size + partial hash only) and gets fully confirmed the moment
+one of its files is actually about to be deleted, not before -- see
+"Deleting" below. Override the cutoff with `--large-threshold BYTES`, or
+`--large-threshold 0` to always confirm during the scan regardless of size.
+
 ## Setup
 
 ```bash
@@ -117,6 +125,11 @@ check the copies you want gone and "Delete Checked" -- files are moved to
 the Trash (via `send2trash`), never permanently deleted. Each duplicate
 group defaults to keeping the first copy and checking the rest, and the
 app refuses to let every copy in a group be checked at once, so you can't
-accidentally wipe out a file entirely. "History" shows past runs from
-both the GUI and the CLI, with "Export..." / "Import..." buttons for the
-same JSON file used by `--export-history` / `--import-history`.
+accidentally wipe out a file entirely. A group of very large files that
+wasn't fully verified during the scan is labeled "(unverified -- large
+file, checked before deletion)"; deleting a checked file from such a group
+compares it against the kept file(s) first, and skips it (with a warning,
+nothing deleted) rather than trust an unconfirmed match. "History" shows
+past runs from both the GUI and the CLI, with "Export..." / "Import..."
+buttons for the same JSON file used by `--export-history` /
+`--import-history`.

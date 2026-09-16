@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
-from ..dedupe import DuplicateGroup, ScanResult
+from ..dedupe import DuplicateGroup, ScanResult, files_equal
 from ..formatting import human_size
 from ..history import record_run
 from ..resume import ResumeState, clear_resume_state, load_resume_state, save_resume_state
@@ -198,7 +198,11 @@ class MainWindow(QMainWindow):
     # -- results tree -----------------------------------------------------
 
     def _add_group(self, group: DuplicateGroup) -> None:
-        header = QTreeWidgetItem([f"{len(group.paths)} copies, {human_size(group.size)} each", ""])
+        label = f"{len(group.paths)} copies, {human_size(group.size)} each"
+        if not group.confirmed:
+            label += "  (unverified -- large file, checked before deletion)"
+        header = QTreeWidgetItem([label, ""])
+        header.setData(0, Qt.ItemDataRole.UserRole, group)
         self.results_tree.addTopLevelItem(header)
         for index, path in enumerate(group.paths):
             child = QTreeWidgetItem([str(path), human_size(group.size)])
@@ -247,6 +251,19 @@ class MainWindow(QMainWindow):
 
     # -- deletion -----------------------------------------------------
 
+    def _kept_paths(self, group_item: QTreeWidgetItem) -> list[Path]:
+        """Paths under `group_item` currently unchecked (i.e. being kept),
+        used as references to verify an unconfirmed group's files against
+        right before deletion -- see `_add_group`/`DuplicateGroup.confirmed`.
+        """
+        kept = []
+        for i in range(group_item.childCount()):
+            child = group_item.child(i)
+            if child.checkState(0) == Qt.CheckState.Unchecked:
+                path, _size = child.data(0, Qt.ItemDataRole.UserRole)
+                kept.append(path)
+        return kept
+
     def _delete_checked(self) -> None:
         items = self._checked_items()
         if not items:
@@ -263,15 +280,37 @@ class MainWindow(QMainWindow):
         failures = []
         for item in items:
             path, _size = item.data(0, Qt.ItemDataRole.UserRole)
+            group_item = item.parent()
+            group: DuplicateGroup = group_item.data(0, Qt.ItemDataRole.UserRole)
+
+            if not group.confirmed:
+                # Confirmation of this group was deferred during the scan
+                # (a very large file) -- do it now, against whichever
+                # file(s) in the group are being kept, before actually
+                # deleting anything.
+                verified = False
+                for reference in self._kept_paths(group_item):
+                    try:
+                        if files_equal(reference, path):
+                            verified = True
+                            break
+                    except OSError:
+                        continue
+                if not verified:
+                    failures.append(
+                        f"{path}: not verified as an actual duplicate of the kept file(s) -- "
+                        "skipped rather than risk deleting a non-duplicate"
+                    )
+                    continue
+
             try:
                 send2trash(str(path))
             except OSError as exc:
                 failures.append(f"{path}: {exc}")
                 continue
-            group = item.parent()
-            group.removeChild(item)
-            if group.childCount() <= 1:
-                index = self.results_tree.indexOfTopLevelItem(group)
+            group_item.removeChild(item)
+            if group_item.childCount() <= 1:
+                index = self.results_tree.indexOfTopLevelItem(group_item)
                 self.results_tree.takeTopLevelItem(index)
 
         self._update_reclaimable_label()

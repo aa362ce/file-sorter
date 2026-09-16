@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .dedupe import default_workers, find_duplicates
+from .dedupe import LARGE_FILE_THRESHOLD, default_workers, find_duplicates
 from .formatting import human_size
 from .history import export_history, import_history, load_history, record_run
 from .resume import clear_resume_state, load_resume_state, save_resume_state
@@ -54,6 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         metavar="N",
         help=f"Number of threads to hash files with (default: {default_workers()}, one per CPU core)",
+    )
+    parser.add_argument(
+        "--large-threshold",
+        type=int,
+        default=LARGE_FILE_THRESHOLD,
+        metavar="BYTES",
+        help=(
+            "Files at or above this size are reported as probable duplicates "
+            "(matched by size + partial hash) without being fully compared during "
+            f"the scan -- confirmation is deferred until deletion (default: {LARGE_FILE_THRESHOLD}, "
+            "i.e. 500MB; pass 0 to always fully confirm during the scan)"
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -170,6 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             cancel_event=cancel_event,
             resume_state=resume_state,
             workers=args.threads,
+            large_file_threshold=args.large_threshold,
         )
     finally:
         signal.signal(signal.SIGINT, previous_handler)
@@ -189,18 +202,27 @@ def main(argv: list[str] | None = None) -> int:
         print("No duplicates found." if not result.cancelled else "Scan cancelled before any duplicates were confirmed.")
     else:
         total_wasted = 0
+        deferred_count = 0
         for group in groups:
             wasted = group.size * (len(group.paths) - 1)
             total_wasted += wasted
-            print(
-                f"\n{len(group.paths)} copies, {human_size(group.size)} each "
-                f"(sha256 {group.file_hash[:12]}...):"
-            )
+            if group.confirmed:
+                label = f"(sha256 {group.file_hash[:12]}...)"
+            else:
+                deferred_count += 1
+                label = "(NOT VERIFIED -- large file, matched by size + partial hash only)"
+            print(f"\n{len(group.paths)} copies, {human_size(group.size)} each {label}:")
             for path in group.paths:
                 print(f"  {path}")
 
         note = " (scan cancelled -- partial results)" if result.cancelled else ""
         print(f"\n{len(groups)} duplicate group(s), {human_size(total_wasted)} reclaimable{note}.")
+        if deferred_count:
+            print(
+                f"{deferred_count} of those group(s) are large files not fully verified -- "
+                "they will be confirmed before deletion, and a group could turn out to be a "
+                "false match (files that only happen to share a size and partial hash)."
+            )
 
     if result.skipped:
         print(f"\nSkipped {len(result.skipped)} unreadable file(s) (permission denied or removed).")
