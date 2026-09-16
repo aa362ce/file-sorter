@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -97,6 +98,8 @@ class MainWindow(QMainWindow):
 
         self.results_tree = QTreeWidget()
         self.results_tree.setHeaderLabels(["File", "Size"])
+        self.results_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.results_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.results_tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.results_tree, 1)
 
