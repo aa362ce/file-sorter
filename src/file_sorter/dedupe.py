@@ -8,10 +8,13 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Optional, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
 from .resume import ResumeState
+
+if TYPE_CHECKING:
+    from .folders import FolderGroup
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
 
@@ -312,6 +315,7 @@ class ScanResult:
     skipped: list[Path]
     cancelled: bool = False
     resume_state: Optional[ResumeState] = None
+    folder_groups: list["FolderGroup"] = field(default_factory=list)
 
 
 def _partial_key(size: int, partial_hash: str) -> str:
@@ -590,4 +594,23 @@ def find_duplicates(
     else:
         logger.info("Done: %d duplicate group(s), %d file(s) skipped", len(groups), len(skipped))
 
-    return ScanResult(groups=groups, skipped=skipped, cancelled=cancelled, resume_state=new_resume_state)
+    folder_groups: list["FolderGroup"] = []
+    if not cancelled:
+        # Only meaningful for a complete scan -- a cancelled one hasn't
+        # finished confirming every candidate, so a directory could look
+        # "fully accounted for" purely because its remaining files weren't
+        # reached yet, not because they're actually unique.
+        from .folders import find_duplicate_folders
+
+        all_files = [p for paths in by_size.values() for p in paths]
+        folder_groups = find_duplicate_folders(all_files, skipped, groups, directories)
+        if folder_groups:
+            logger.info("Found %d duplicate folder(s)", len(folder_groups))
+
+    return ScanResult(
+        groups=groups,
+        skipped=skipped,
+        cancelled=cancelled,
+        resume_state=new_resume_state,
+        folder_groups=folder_groups,
+    )

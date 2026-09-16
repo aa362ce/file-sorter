@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from send2trash import send2trash
 
 from ..dedupe import DuplicateGroup, ScanResult, files_equal
+from ..folders import FolderGroup
 from ..formatting import human_size
 from ..history import record_run
 from ..resume import ResumeState, clear_resume_state, load_resume_state, save_resume_state
@@ -172,6 +173,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
 
+        for folder_group in result.folder_groups:
+            self._add_folder_group(folder_group)
         for group in result.groups:
             self._add_group(group)
 
@@ -185,9 +188,12 @@ class MainWindow(QMainWindow):
             clear_resume_state()
             self.resume_btn.setEnabled(False)
 
+        folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
         cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
-        self.status_label.setText(f"{len(result.groups)} duplicate group(s) found{skipped_note}{cancelled_note}")
+        self.status_label.setText(
+            f"{len(result.groups)} duplicate group(s) found{folder_note}{skipped_note}{cancelled_note}"
+        )
         self.delete_btn.setEnabled(bool(result.groups))
         self._update_reclaimable_label()
         self._worker = None
@@ -196,6 +202,27 @@ class MainWindow(QMainWindow):
         HistoryDialog(self).exec()
 
     # -- results tree -----------------------------------------------------
+
+    def _add_folder_group(self, group: FolderGroup) -> None:
+        """Informational only -- the individual files inside these folders
+        are also added as regular (checkable) groups via `_add_group`, so
+        deletion still works normally at the file level; these rows just
+        summarize that a whole directory is redundant.
+        """
+        label = f"\U0001F4C1 Folder duplicate: {len(group.paths)} copies ({group.file_count} files, {human_size(group.size)} each)"
+        if not group.confirmed:
+            label += "  (unverified -- large file(s), checked before deletion)"
+        header = QTreeWidgetItem([label, ""])
+        header.setFlags(header.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        self.results_tree.addTopLevelItem(header)
+        for path in group.paths:
+            child = QTreeWidgetItem([str(path), human_size(group.size)])
+            # No UserRole group data is set on `header` (unlike _add_group),
+            # so these rows must stay non-checkable -- _delete_checked()
+            # would crash trying to read a group off it otherwise.
+            child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            header.addChild(child)
+        header.setExpanded(True)
 
     def _add_group(self, group: DuplicateGroup) -> None:
         label = f"{len(group.paths)} copies, {human_size(group.size)} each"

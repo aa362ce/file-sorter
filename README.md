@@ -29,6 +29,19 @@ one of its files is actually about to be deleted, not before -- see
 "Deleting" below. Override the cutoff with `--large-threshold BYTES`, or
 `--large-threshold 0` to always confirm during the scan regardless of size.
 
+### Duplicate folders
+
+A whole directory whose contents (recursively) exactly match another
+directory's -- same relative files, each pair an exact duplicate -- is
+reported as a duplicate folder, e.g. two full copies of a photo library
+under different names. This costs no extra work: it's built entirely from
+the file-level results above, since a directory can only match another one
+if every file inside it already has a match somewhere in the scan. Nested
+matches are collapsed -- if two folders match, their matching
+subfolders aren't reported separately. The files inside a duplicate folder
+are still listed (and deletable) individually as regular duplicate groups
+too; folder detection is just a higher-level summary on top.
+
 ## Setup
 
 ```bash
@@ -147,7 +160,10 @@ accidentally wipe out a file entirely. A group of very large files that
 wasn't fully verified during the scan is labeled "(unverified -- large
 file, checked before deletion)"; deleting a checked file from such a group
 compares it against the kept file(s) first, and skips it (with a warning,
-nothing deleted) rather than trust an unconfirmed match. "History" shows
-past runs from both the GUI and the CLI, with "Export..." / "Import..."
-buttons for the same JSON file used by `--export-history` /
-`--import-history`.
+nothing deleted) rather than trust an unconfirmed match. A duplicate folder
+(see above) shows up as its own "📁 Folder duplicate" row summarizing the
+match, listed above the regular groups; it's informational only (not
+checkable) since the files inside it are already there as regular,
+deletable duplicate groups. "History" shows past runs from both the GUI
+and the CLI, with "Export..." / "Import..." buttons for the same JSON file
+used by `--export-history` / `--import-history`.

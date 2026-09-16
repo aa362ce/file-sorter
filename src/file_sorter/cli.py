@@ -224,6 +224,25 @@ def main(argv: list[str] | None = None) -> int:
     else:
         clear_resume_state()
 
+    folder_groups = result.folder_groups
+    if args.min_size:
+        folder_groups = [g for g in folder_groups if g.size >= args.min_size]
+
+    if folder_groups:
+        for fg in folder_groups:
+            label = (
+                f"({fg.file_count} file(s), {human_size(fg.size)} each)"
+                if fg.confirmed
+                else f"({fg.file_count} file(s), {human_size(fg.size)} each, NOT VERIFIED -- large file(s))"
+            )
+            print(f"\nFolder duplicate: {len(fg.paths)} copies {label}:")
+            for path in fg.paths:
+                print(f"  {path}")
+        print(
+            f"\n{len(folder_groups)} duplicate folder(s) found -- their files are also listed "
+            "individually below, and --delete handles them at the file level."
+        )
+
     groups = result.groups
     if args.min_size:
         groups = [g for g in groups if g.size >= args.min_size]
