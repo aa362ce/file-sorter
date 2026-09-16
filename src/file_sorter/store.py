@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Optional
@@ -52,12 +53,13 @@ class ResumeState:
     content-comparison confirmation isn't resumable at individual-file
     granularity the way independent hashing was.
 
-    A state saved via `save_resume_state` mid-scan (a "checkpoint", see
-    `dedupe.find_duplicates`'s `on_checkpoint`) has exactly the same shape
-    as one saved when a scan is actually cancelled -- there's nothing
-    special about the final save, so a hard crash or power loss finds
-    whatever the most recent checkpoint left behind, not just a clean
-    Cancel.
+    A scan also checkpoints incrementally as it runs (see
+    `dedupe.find_duplicates`'s `on_checkpoint` and `checkpoint_progress`
+    below) so a hard crash or power loss finds recent progress, not just
+    whatever was there after a clean Cancel -- `ResumeState` is just the
+    shape progress takes once assembled, whether that happened via one
+    full write at cancellation or many small incremental ones during the
+    scan.
     """
 
     directories: list[str]
@@ -67,6 +69,28 @@ class ResumeState:
     by_full: dict[str, list[str]] = field(default_factory=dict)
     processed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CheckpointDelta:
+    """What's new since the previous checkpoint of a running scan (see
+    `dedupe.find_duplicates`'s `on_checkpoint`) -- deliberately *not* the
+    full accumulated state, so persisting it (via `checkpoint_progress`)
+    costs work proportional to this delta, not to how far into a
+    million-file scan it fires.
+
+    `new_entries` is (bucket_key, path) pairs newly confirmed into
+    `by_partial` (`stage` "quick_hash") or `by_full` (`stage` "full_hash")
+    since the last checkpoint. `by_size` and `directories` are only set on
+    the very first checkpoint of a run -- neither changes again after
+    that, so there's no reason to resend either one every time.
+    """
+
+    stage: str
+    new_entries: list[tuple[str, str]] = field(default_factory=list)
+    new_skipped: list[str] = field(default_factory=list)
+    by_size: Optional[dict[str, list[str]]] = None
+    directories: Optional[list[str]] = None
 
 
 @dataclass
@@ -114,17 +138,19 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             cancelled INTEGER NOT NULL,
             duration_seconds REAL NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS resume_states (
+        CREATE TABLE IF NOT EXISTS resume_runs (
             run_id TEXT PRIMARY KEY,
             directories TEXT NOT NULL,
             stage TEXT NOT NULL,
-            by_size TEXT NOT NULL,
-            by_partial TEXT NOT NULL,
-            by_full TEXT NOT NULL,
-            processed TEXT NOT NULL,
-            skipped TEXT NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS resume_progress (
+            run_id TEXT NOT NULL,
+            list_name TEXT NOT NULL,
+            key TEXT NOT NULL,
+            path TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_resume_progress_run ON resume_progress(run_id);
         """
     )
     conn.commit()
@@ -157,7 +183,7 @@ def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
                         state = ResumeState(**data)
                     except TypeError:
                         continue
-                    _upsert_resume_state(conn, run_id, state)
+                    _replace_resume_state(conn, run_id, state)
             conn.commit()
             _LEGACY_RESUME_FILE.rename(_LEGACY_RESUME_FILE.with_suffix(".json.migrated"))
         except OSError:
@@ -165,101 +191,172 @@ def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
 
 
 # -- resume state -----------------------------------------------------
+#
+# `resume_runs` holds one small row per run (its directories and current
+# stage). `resume_progress` holds every path making up that run's
+# by_size/by_partial/by_full/skipped, one row each, tagged by `list_name`.
+# Splitting it this way is what makes `checkpoint_progress` cheap: adding
+# rows for what's newly confirmed since the last checkpoint is a plain
+# INSERT, not a read-modify-write of an ever-growing JSON blob -- its cost
+# never depends on how much of the run has already been persisted.
 
 
-def _upsert_resume_state(conn: sqlite3.Connection, run_id: str, state: ResumeState) -> None:
+def _touch_resume_run(conn: sqlite3.Connection, run_id: str, *, stage: str, directories: Optional[list[str]]) -> None:
     conn.execute(
         """
-        INSERT INTO resume_states
-            (run_id, directories, stage, by_size, by_partial, by_full, processed, skipped, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO resume_runs (run_id, directories, stage, updated_at)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET
-            directories=excluded.directories,
             stage=excluded.stage,
-            by_size=excluded.by_size,
-            by_partial=excluded.by_partial,
-            by_full=excluded.by_full,
-            processed=excluded.processed,
-            skipped=excluded.skipped,
             updated_at=excluded.updated_at
-        """,
-        (
-            run_id,
-            json.dumps(state.directories),
-            state.stage,
-            json.dumps(state.by_size),
-            json.dumps(state.by_partial),
-            json.dumps(state.by_full),
-            json.dumps(state.processed),
-            json.dumps(state.skipped),
-            time.time(),
-        ),
-    )
-    row = conn.execute("SELECT COUNT(*) FROM resume_states").fetchone()
-    if row[0] > MAX_RESUME_STATES:
-        conn.execute(
             """
-            DELETE FROM resume_states WHERE run_id IN (
-                SELECT run_id FROM resume_states ORDER BY updated_at ASC LIMIT ?
-            )
-            """,
-            (row[0] - MAX_RESUME_STATES,),
-        )
-
-
-def _row_to_resume_state(row: sqlite3.Row) -> ResumeState:
-    return ResumeState(
-        directories=json.loads(row["directories"]),
-        stage=row["stage"],
-        by_size=json.loads(row["by_size"]),
-        by_partial=json.loads(row["by_partial"]),
-        by_full=json.loads(row["by_full"]),
-        processed=json.loads(row["processed"]),
-        skipped=json.loads(row["skipped"]),
+        + (", directories=excluded.directories" if directories is not None else ""),
+        (run_id, json.dumps(directories if directories is not None else []), stage, time.time()),
     )
+
+
+def _evict_old_resume_runs(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT COUNT(*) FROM resume_runs").fetchone()
+    if row[0] <= MAX_RESUME_STATES:
+        return
+    stale_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT run_id FROM resume_runs ORDER BY updated_at ASC LIMIT ?",
+            (row[0] - MAX_RESUME_STATES,),
+        ).fetchall()
+    ]
+    conn.executemany("DELETE FROM resume_runs WHERE run_id = ?", [(rid,) for rid in stale_ids])
+    conn.executemany("DELETE FROM resume_progress WHERE run_id = ?", [(rid,) for rid in stale_ids])
+
+
+def _replace_resume_state(conn: sqlite3.Connection, run_id: str, state: ResumeState) -> None:
+    """Write the full state, replacing anything already stored for this
+    run_id -- an O(size of state) operation, appropriate for the one-off
+    authoritative save on cancellation (or a legacy-JSON import), but not
+    for frequent mid-scan checkpointing (see `checkpoint_progress`).
+    """
+    _touch_resume_run(conn, run_id, stage=state.stage, directories=state.directories)
+    conn.execute("DELETE FROM resume_progress WHERE run_id = ?", (run_id,))
+    rows = [(run_id, "by_size", key, path) for key, paths in state.by_size.items() for path in paths]
+    rows += [(run_id, "by_partial", key, path) for key, paths in state.by_partial.items() for path in paths]
+    rows += [(run_id, "by_full", key, path) for key, paths in state.by_full.items() for path in paths]
+    rows += [(run_id, "skipped", "", path) for path in state.skipped]
+    if rows:
+        conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
+    _evict_old_resume_runs(conn)
 
 
 def save_resume_state(run_id: str, state: ResumeState) -> None:
-    """Persist `state` for `run_id`, replacing any previously saved state
-    for the same run.
-
-    This is a single-row UPSERT, not a rewrite of every saved run's state
-    the way the old JSON store's `_save_all` was -- cheap enough to call
-    every couple thousand files during a long hash stage (see
-    `dedupe.find_duplicates`'s `on_checkpoint`) as well as once when a
-    scan is cancelled, so progress on a large scan survives a crash or
-    power loss, not just a clean Cancel.
+    """Persist the full `state` for `run_id`, replacing anything already
+    saved for the same run -- used for the one authoritative save when a
+    scan is actually cancelled. For frequent mid-scan progress saves, see
+    `checkpoint_progress` instead, which only ever writes what's new.
     """
     try:
         conn = _connect()
     except OSError:
         return
     with conn:
-        _upsert_resume_state(conn, run_id, state)
+        _replace_resume_state(conn, run_id, state)
+    conn.close()
+
+
+def checkpoint_progress(run_id: str, delta: CheckpointDelta) -> None:
+    """Persist `delta` -- what's new since the previous checkpoint of a
+    running scan -- without touching anything already saved for `run_id`.
+
+    Every call is an append of a handful of rows plus one tiny metadata
+    update, regardless of how much of the run is already stored, which is
+    what keeps checkpointing viable on a scan with millions of files: the
+    cost of the 500th checkpoint is the same as the cost of the 5th.
+    """
+    try:
+        conn = _connect()
+    except OSError:
+        return
+    with conn:
+        _touch_resume_run(conn, run_id, stage=delta.stage, directories=delta.directories)
+        if delta.by_size is not None:
+            # by_size doesn't change once a run starts hashing -- sent (and
+            # stored) exactly once, so replace rather than append, in case
+            # a retry ever sends it twice.
+            conn.execute("DELETE FROM resume_progress WHERE run_id = ? AND list_name = 'by_size'", (run_id,))
+            rows = [(run_id, "by_size", key, path) for key, paths in delta.by_size.items() for path in paths]
+            if rows:
+                conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
+        if delta.new_entries:
+            list_name = "by_partial" if delta.stage == "quick_hash" else "by_full"
+            conn.executemany(
+                "INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)",
+                [(run_id, list_name, key, path) for key, path in delta.new_entries],
+            )
+        if delta.new_skipped:
+            conn.executemany(
+                "INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, 'skipped', '', ?)",
+                [(run_id, path) for path in delta.new_skipped],
+            )
+        _evict_old_resume_runs(conn)
     conn.close()
 
 
 def load_resume_state(run_id: str) -> Optional[ResumeState]:
     conn = _connect()
-    conn.row_factory = sqlite3.Row
     try:
-        row = conn.execute("SELECT * FROM resume_states WHERE run_id = ?", (run_id,)).fetchone()
+        meta = conn.execute("SELECT directories, stage FROM resume_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if meta is None:
+            return None
+        rows = conn.execute(
+            "SELECT list_name, key, path FROM resume_progress WHERE run_id = ?", (run_id,)
+        ).fetchall()
     finally:
         conn.close()
-    return _row_to_resume_state(row) if row is not None else None
+
+    by_size: dict[str, list[str]] = defaultdict(list)
+    by_partial: dict[str, list[str]] = defaultdict(list)
+    by_full: dict[str, list[str]] = defaultdict(list)
+    skipped: list[str] = []
+    for list_name, key, path in rows:
+        if list_name == "by_size":
+            by_size[key].append(path)
+        elif list_name == "by_partial":
+            by_partial[key].append(path)
+        elif list_name == "by_full":
+            by_full[key].append(path)
+        elif list_name == "skipped":
+            skipped.append(path)
+
+    # `processed` isn't stored directly -- every path that ended up in
+    # by_partial/by_full or skipped was, by construction, also counted as
+    # processed (see dedupe._hash_parallel/_group_by_content), so this
+    # union reconstructs it exactly for whichever stage was in progress.
+    processed = sorted(
+        {p for paths in by_partial.values() for p in paths} | {p for paths in by_full.values() for p in paths}
+        | set(skipped)
+    )
+    return ResumeState(
+        directories=json.loads(meta[0]),
+        stage=meta[1],
+        by_size=dict(by_size),
+        by_partial=dict(by_partial),
+        by_full=dict(by_full),
+        processed=processed,
+        skipped=skipped,
+    )
 
 
 def clear_resume_state(run_id: str) -> None:
     conn = _connect()
     with conn:
-        conn.execute("DELETE FROM resume_states WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM resume_runs WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM resume_progress WHERE run_id = ?", (run_id,))
     conn.close()
 
 
 def resumable_run_ids() -> set[str]:
     conn = _connect()
     try:
-        rows = conn.execute("SELECT run_id FROM resume_states").fetchall()
+        rows = conn.execute("SELECT run_id FROM resume_runs").fetchall()
     finally:
         conn.close()
     return {row[0] for row in rows}
@@ -268,7 +365,7 @@ def resumable_run_ids() -> set[str]:
 def latest_resume_run_id() -> Optional[str]:
     conn = _connect()
     try:
-        row = conn.execute("SELECT run_id FROM resume_states ORDER BY updated_at DESC LIMIT 1").fetchone()
+        row = conn.execute("SELECT run_id FROM resume_runs ORDER BY updated_at DESC LIMIT 1").fetchone()
     finally:
         conn.close()
     return row[0] if row is not None else None

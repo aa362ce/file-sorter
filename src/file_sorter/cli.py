@@ -16,6 +16,7 @@ from .dedupe import LARGE_FILE_THRESHOLD, DuplicateGroup, default_workers, files
 from .folders import FolderGroup
 from .formatting import human_size
 from .store import (
+    checkpoint_progress,
     clear_resume_state,
     export_history,
     import_history,
@@ -279,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
             resume_state=resume_state,
             workers=args.threads,
             large_file_threshold=args.large_threshold,
-            on_checkpoint=lambda state: save_resume_state(run_id, state),
+            on_checkpoint=lambda delta: checkpoint_progress(run_id, delta),
         )
     finally:
         signal.signal(signal.SIGINT, previous_handler)

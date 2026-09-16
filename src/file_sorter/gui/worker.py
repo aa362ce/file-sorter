@@ -7,7 +7,7 @@ from typing import Iterable, Optional
 from PySide6.QtCore import QThread, Signal
 
 from ..dedupe import ScanResult, find_duplicates
-from ..store import ResumeState, save_resume_state
+from ..store import CheckpointDelta, ResumeState, checkpoint_progress
 
 
 class ScanWorker(QThread):
@@ -33,12 +33,12 @@ class ScanWorker(QThread):
     def cancel(self) -> None:
         self._cancel_event.set()
 
-    def _checkpoint(self, state: ResumeState) -> None:
+    def _checkpoint(self, delta: CheckpointDelta) -> None:
         # Runs on this worker thread, not the GUI thread -- safe since
-        # save_resume_state opens and closes its own SQLite connection
+        # checkpoint_progress opens and closes its own SQLite connection
         # per call rather than sharing one across threads.
         if self._run_id is not None:
-            save_resume_state(self._run_id, state)
+            checkpoint_progress(self._run_id, delta)
 
     def run(self) -> None:
         result = find_duplicates(

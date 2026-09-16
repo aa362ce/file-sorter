@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
-from .store import ResumeState
+from .store import CheckpointDelta, ResumeState
 
 if TYPE_CHECKING:
     from .folders import FolderGroup
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
-CheckpointCallback = Callable[[ResumeState], None]
+CheckpointCallback = Callable[[CheckpointDelta], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
@@ -136,7 +136,7 @@ def _group_by_content(
     show_progress: bool,
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
-    on_checkpoint: Optional[Callable[[dict[str, list[Path]], list[Path], list[Path]], None]] = None,
+    on_checkpoint: Optional[Callable[[list[tuple[str, Path]], list[Path]], None]] = None,
 ) -> tuple[dict[str, list[Path]], list[Path], list[Path], bool]:
     """Confirm which files within each bucket (files that already share a
     size and a partial hash from earlier stages) are true duplicates, by
@@ -151,6 +151,15 @@ def _group_by_content(
     split into separate groups. A confirmed group's identifying hash is
     computed from its representative only, once -- files that turn out not
     to match anything are never hashed at all.
+
+    `on_checkpoint(new_entries, new_skipped)`, if given, is called every
+    `CHECKPOINT_INTERVAL` files with only what's new *since the last call*
+    (as (digest, path) pairs newly confirmed into `result`, and paths newly
+    added to `skipped`) -- not the full accumulated state. That keeps each
+    checkpoint's cost proportional to `CHECKPOINT_INTERVAL` regardless of
+    how far into a huge scan it fires, instead of proportional to total
+    progress so far (which would make checkpointing itself the bottleneck
+    on a scan with millions of files).
     """
     result: dict[str, list[Path]] = {}
     processed: list[Path] = []
@@ -159,13 +168,31 @@ def _group_by_content(
     total = sum(len(bucket) for bucket in buckets)
     progress = Progress(stage_label, total=total, enabled=show_progress)
 
+    # Append-only logs mirroring `result`/`skipped`, used only to compute
+    # cheap since-last-checkpoint deltas below -- see `on_checkpoint` above.
+    checkpoint_log: list[tuple[str, Path]] = []
+    flushed_entries = 0
+    flushed_skipped = 0
+
+    def flush_checkpoint(*, force: bool = False) -> None:
+        nonlocal flushed_entries, flushed_skipped
+        if on_checkpoint is None:
+            return
+        if not force and len(processed) % CHECKPOINT_INTERVAL != 0:
+            return
+        new_entries = checkpoint_log[flushed_entries:]
+        new_skipped = skipped[flushed_skipped:]
+        if new_entries or new_skipped:
+            on_checkpoint(new_entries, new_skipped)
+        flushed_entries = len(checkpoint_log)
+        flushed_skipped = len(skipped)
+
     def mark_done(path: Path) -> None:
         processed.append(path)
         progress.update()
         if on_progress:
             on_progress(stage_label, progress.count, total)
-        if on_checkpoint and len(processed) % CHECKPOINT_INTERVAL == 0:
-            on_checkpoint(result, processed, skipped)
+        flush_checkpoint()
 
     def compare(representative: Path, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
         try:
@@ -177,7 +204,9 @@ def _group_by_content(
         if not matched_others:
             return
         digest = _full_hash(representative)
-        result.setdefault(digest, []).extend([representative] + matched_others)
+        group_paths = [representative] + matched_others
+        result.setdefault(digest, []).extend(group_paths)
+        checkpoint_log.extend((digest, p) for p in group_paths)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
     try:
@@ -224,6 +253,12 @@ def _group_by_content(
     finally:
         if pool is not None:
             pool.shutdown(wait=True)
+    # Unconditional final flush -- without it, whatever's landed in `result`
+    # since the last periodic checkpoint (including all of it, if this
+    # stage had fewer than CHECKPOINT_INTERVAL files total) would never
+    # reach `on_checkpoint`, leaving a resumed stage 3 with an incomplete
+    # `by_full` even though this stage otherwise finished cleanly.
+    flush_checkpoint(force=True)
     progress.close()
     return result, processed, skipped, cancelled
 
@@ -239,7 +274,7 @@ def _hash_parallel(
     show_progress: bool,
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
-    on_checkpoint: Optional[Callable[[dict[K, list[Path]], list[Path], list[Path]], None]] = None,
+    on_checkpoint: Optional[Callable[[list[tuple[K, Path]], list[Path]], None]] = None,
 ) -> tuple[dict[K, list[Path]], list[Path], list[Path], bool]:
     """Hash `items` into buckets keyed by `key_of`, spreading the reads and
     hashing across a thread pool of `workers` threads.
@@ -254,6 +289,11 @@ def _hash_parallel(
     between every single file, since a whole batch is already in flight
     together by the time it could be checked; whatever a batch finishes is
     kept before stopping.
+
+    `on_checkpoint(new_entries, new_skipped)`, if given, is called every
+    `CHECKPOINT_INTERVAL` files with only what's new since the last call --
+    see `_group_by_content`'s identical contract for why (checkpoint cost
+    must stay proportional to `CHECKPOINT_INTERVAL`, not to total progress).
     """
     result: dict[K, list[Path]] = defaultdict(list)
     processed: list[Path] = []
@@ -262,6 +302,23 @@ def _hash_parallel(
     total = len(items)
     progress = Progress(stage_label, total=total, enabled=show_progress)
 
+    checkpoint_log: list[tuple[K, Path]] = []
+    flushed_entries = 0
+    flushed_skipped = 0
+
+    def flush_checkpoint(*, force: bool = False) -> None:
+        nonlocal flushed_entries, flushed_skipped
+        if on_checkpoint is None:
+            return
+        if not force and len(processed) % CHECKPOINT_INTERVAL != 0:
+            return
+        new_entries = checkpoint_log[flushed_entries:]
+        new_skipped = skipped[flushed_skipped:]
+        if new_entries or new_skipped:
+            on_checkpoint(new_entries, new_skipped)
+        flushed_entries = len(checkpoint_log)
+        flushed_skipped = len(skipped)
+
     def record(item: T, digest: Optional[str], error: Optional[OSError]) -> None:
         path = path_of(item)
         if error is not None:
@@ -269,13 +326,14 @@ def _hash_parallel(
             skipped.append(path)
             processed.append(path)
         else:
-            result[key_of(item, digest)].append(path)
+            key = key_of(item, digest)
+            result[key].append(path)
+            checkpoint_log.append((key, path))
             processed.append(path)
             progress.update()
             if on_progress:
                 on_progress(stage_label, progress.count, total)
-        if on_checkpoint and len(processed) % CHECKPOINT_INTERVAL == 0:
-            on_checkpoint(result, processed, skipped)
+        flush_checkpoint()
 
     if workers <= 1 or total <= 1:
         for item in items:
@@ -286,6 +344,7 @@ def _hash_parallel(
                 record(item, hash_fn(path_of(item)), None)
             except OSError as exc:
                 record(item, None, exc)
+        flush_checkpoint(force=True)
         progress.close()
         return result, processed, skipped, cancelled
 
@@ -303,6 +362,7 @@ def _hash_parallel(
                 except OSError as exc:
                     record(item, None, exc)
             index += len(batch)
+    flush_checkpoint(force=True)
     progress.close()
     return result, processed, skipped, cancelled
 
@@ -414,16 +474,17 @@ def find_duplicates(
     disable deferral and always confirm during the scan, regardless of
     size. Defaults to `LARGE_FILE_THRESHOLD` (500MB).
 
-    `on_checkpoint(state)`, if given, is called periodically (every
-    `CHECKPOINT_INTERVAL` files) during stage 2 and stage 3 with a
-    `ResumeState` snapshot of progress so far -- the same shape as
-    `ScanResult.resume_state`, just saved *during* the scan instead of
-    only once it's cancelled. This is how a caller persists progress
-    (e.g. `store.save_resume_state`) incrementally for a scan large
-    enough that losing it all to a crash or power loss, rather than just
-    a clean Cancel, would be costly. Stage 1 (the directory walk) has no
-    checkpoint of its own -- a `resume_state` with stage "scanning" isn't
-    resumable either (see above), so there'd be nothing to do with one.
+    `on_checkpoint(delta)`, if given, is called periodically (every
+    `CHECKPOINT_INTERVAL` files, and once more with whatever's left when a
+    stage finishes) during stage 2 and stage 3 with a `CheckpointDelta` --
+    only what's newly confirmed *since the previous call*, not the full
+    state, so a caller persisting it (via `store.checkpoint_progress`)
+    pays a cost proportional to `CHECKPOINT_INTERVAL`, not to how far into
+    a scan with millions of files it fires. This is how progress on a
+    large scan survives a crash or power loss, not just a clean Cancel.
+    Stage 1 (the directory walk) has no checkpoint of its own -- a
+    `resume_state` with stage "scanning" isn't resumable either (see
+    above), so there'd be nothing to do with one.
     """
     directories = list(directories)
     skipped: list[Path] = []
@@ -433,6 +494,22 @@ def find_duplicates(
 
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
+
+    # by_size and directories are invariant for the rest of this call once
+    # stage 2 starts, so they're only worth sending once -- whichever
+    # checkpoint (stage 2 or, if resuming straight into stage 3, stage 3)
+    # fires first.
+    run_meta_sent = False
+
+    def _run_meta() -> tuple[Optional[dict[str, list[str]]], Optional[list[str]]]:
+        nonlocal run_meta_sent
+        if run_meta_sent:
+            return None, None
+        run_meta_sent = True
+        return (
+            {str(size): [str(p) for p in paths] for size, paths in by_size.items()},
+            [str(d) for d in directories],
+        )
 
     resume_stage = resume_state.stage if resume_state is not None else None
 
@@ -495,26 +572,17 @@ def find_duplicates(
             else:
                 logger.info("Stage 2/3: quick-hashing %d candidate file(s)", len(partial_candidates))
 
-        def _checkpoint_stage2(
-            partial_result: dict[tuple[int, str], list[Path]], processed_so_far: list[Path], skipped_so_far: list[Path]
-        ) -> None:
+        def _checkpoint_stage2(new_entries: list[tuple[tuple[int, str], Path]], new_skipped: list[Path]) -> None:
             if on_checkpoint is None:
                 return
-            combined_partial: dict[tuple[int, str], list[Path]] = defaultdict(
-                list, {key: list(paths) for key, paths in by_partial.items()}
-            )
-            for key, paths in partial_result.items():
-                combined_partial[key].extend(paths)
+            by_size_meta, directories_meta = _run_meta()
             on_checkpoint(
-                ResumeState(
-                    directories=[str(d) for d in directories],
+                CheckpointDelta(
                     stage="quick_hash",
-                    by_size={str(size): [str(p) for p in paths] for size, paths in by_size.items()},
-                    by_partial={
-                        _partial_key(*key): [str(p) for p in paths] for key, paths in combined_partial.items()
-                    },
-                    processed=[str(p) for p in processed_so_far],
-                    skipped=[str(p) for p in skipped] + [str(p) for p in skipped_so_far],
+                    new_entries=[(_partial_key(*key), str(p)) for key, p in new_entries],
+                    new_skipped=[str(p) for p in new_skipped],
+                    by_size=by_size_meta,
+                    directories=directories_meta,
                 )
             )
 
@@ -594,23 +662,17 @@ def find_duplicates(
         else:
             logger.info("Stage 3/3: confirming %d candidate file(s) by content", full_total)
 
-        def _checkpoint_stage3(
-            partial_result: dict[str, list[Path]], processed_so_far: list[Path], skipped_so_far: list[Path]
-        ) -> None:
+        def _checkpoint_stage3(new_entries: list[tuple[str, Path]], new_skipped: list[Path]) -> None:
             if on_checkpoint is None:
                 return
-            combined_full: dict[str, list[Path]] = defaultdict(list, {key: list(paths) for key, paths in by_full.items()})
-            for key, paths in partial_result.items():
-                combined_full[key].extend(paths)
+            by_size_meta, directories_meta = _run_meta()
             on_checkpoint(
-                ResumeState(
-                    directories=[str(d) for d in directories],
+                CheckpointDelta(
                     stage="full_hash",
-                    by_size={str(size): [str(p) for p in paths] for size, paths in by_size.items()},
-                    by_partial={_partial_key(*key): [str(p) for p in paths] for key, paths in by_partial.items()},
-                    by_full={h: [str(p) for p in paths] for h, paths in combined_full.items()},
-                    processed=[str(p) for p in processed_so_far],
-                    skipped=[str(p) for p in skipped] + [str(p) for p in skipped_so_far],
+                    new_entries=[(digest, str(p)) for digest, p in new_entries],
+                    new_skipped=[str(p) for p in new_skipped],
+                    by_size=by_size_meta,
+                    directories=directories_meta,
                 )
             )
 
