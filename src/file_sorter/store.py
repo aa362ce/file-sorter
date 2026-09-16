@@ -53,6 +53,12 @@ class ResumeState:
     content-comparison confirmation isn't resumable at individual-file
     granularity the way independent hashing was.
 
+    `completed_dirs` is only meaningful for a "scanning" resume: "dev:ino"
+    keys (see `dedupe._dir_key`) of directories the walk had already fully
+    finished with, so resuming skips re-scanning them entirely instead of
+    re-discovering (and, worse, re-counting) everything already found --
+    see `dedupe._walk_checkpointed`.
+
     A scan also checkpoints incrementally as it runs (see
     `dedupe.find_duplicates`'s `on_checkpoint` and `checkpoint_progress`
     below) so a hard crash or power loss finds recent progress, not just
@@ -69,6 +75,7 @@ class ResumeState:
     by_full: dict[str, list[str]] = field(default_factory=dict)
     processed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    completed_dirs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,16 +86,24 @@ class CheckpointDelta:
     costs work proportional to this delta, not to how far into a
     million-file scan it fires.
 
-    `new_entries` is (bucket_key, path) pairs newly confirmed into
-    `by_partial` (`stage` "quick_hash") or `by_full` (`stage` "full_hash")
-    since the last checkpoint. `by_size` and `directories` are only set on
-    the very first checkpoint of a run -- neither changes again after
-    that, so there's no reason to resend either one every time.
+    `new_entries` is (bucket_key, path) pairs newly added since the last
+    checkpoint -- into `by_size` for `stage` "scanning", `by_partial` for
+    "quick_hash", or `by_full` for "full_hash" (`bucket_key` is the file
+    size as a string for "scanning"). `new_completed_dirs` (only used for
+    "scanning") is directory keys newly finished since the last checkpoint
+    -- see `ResumeState.completed_dirs`. `by_size` and `directories` are
+    only set on the very first checkpoint of a run -- neither changes
+    again after that, so there's no reason to resend either one every
+    time. (`by_size` here means the *stage 2/3* one-time snapshot of the
+    stage-1 result -- unrelated to "scanning"'s own incremental
+    `new_entries`, which feed the same table by a different, appending
+    path; see `checkpoint_progress`.)
     """
 
     stage: str
     new_entries: list[tuple[str, str]] = field(default_factory=list)
     new_skipped: list[str] = field(default_factory=list)
+    new_completed_dirs: list[str] = field(default_factory=list)
     by_size: Optional[dict[str, list[str]]] = None
     directories: Optional[list[str]] = None
 
@@ -242,6 +257,7 @@ def _replace_resume_state(conn: sqlite3.Connection, run_id: str, state: ResumeSt
     rows += [(run_id, "by_partial", key, path) for key, paths in state.by_partial.items() for path in paths]
     rows += [(run_id, "by_full", key, path) for key, paths in state.by_full.items() for path in paths]
     rows += [(run_id, "skipped", "", path) for path in state.skipped]
+    rows += [(run_id, "completed_dirs", "", dir_key) for dir_key in state.completed_dirs]
     if rows:
         conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
     _evict_old_resume_runs(conn)
@@ -286,7 +302,12 @@ def checkpoint_progress(run_id: str, delta: CheckpointDelta) -> None:
             if rows:
                 conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
         if delta.new_entries:
-            list_name = "by_partial" if delta.stage == "quick_hash" else "by_full"
+            # "scanning"'s own new_entries feed by_size too, incrementally,
+            # by appending rather than the replace-on-first-checkpoint path
+            # above -- unlike stage 2/3, stage 1 has no single point where
+            # the whole thing is known at once, so it can only ever grow
+            # row by row as the walk finds more files.
+            list_name = {"scanning": "by_size", "quick_hash": "by_partial", "full_hash": "by_full"}[delta.stage]
             conn.executemany(
                 "INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)",
                 [(run_id, list_name, key, path) for key, path in delta.new_entries],
@@ -295,6 +316,11 @@ def checkpoint_progress(run_id: str, delta: CheckpointDelta) -> None:
             conn.executemany(
                 "INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, 'skipped', '', ?)",
                 [(run_id, path) for path in delta.new_skipped],
+            )
+        if delta.new_completed_dirs:
+            conn.executemany(
+                "INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, 'completed_dirs', '', ?)",
+                [(run_id, dir_key) for dir_key in delta.new_completed_dirs],
             )
         _evict_old_resume_runs(conn)
     conn.close()
@@ -316,6 +342,7 @@ def load_resume_state(run_id: str) -> Optional[ResumeState]:
     by_partial: dict[str, list[str]] = defaultdict(list)
     by_full: dict[str, list[str]] = defaultdict(list)
     skipped: list[str] = []
+    completed_dirs: list[str] = []
     for list_name, key, path in rows:
         if list_name == "by_size":
             by_size[key].append(path)
@@ -325,6 +352,8 @@ def load_resume_state(run_id: str) -> Optional[ResumeState]:
             by_full[key].append(path)
         elif list_name == "skipped":
             skipped.append(path)
+        elif list_name == "completed_dirs":
+            completed_dirs.append(path)
 
     # `processed` isn't stored directly -- every path that ended up in
     # by_partial/by_full or skipped was, by construction, also counted as
@@ -342,6 +371,7 @@ def load_resume_state(run_id: str) -> Optional[ResumeState]:
         by_full=dict(by_full),
         processed=processed,
         skipped=skipped,
+        completed_dirs=completed_dirs,
     )
 
 
