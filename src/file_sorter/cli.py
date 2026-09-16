@@ -88,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the confirmation prompt before deleting (only meaningful with --delete)",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Preview what --delete would do without deleting anything -- including running "
+            "the pre-deletion verification for large-file groups, so the preview shows "
+            "exactly which files would be skipped, not just what's planned. Implies --yes "
+            "(nothing is deleted, so there's nothing to confirm). Only meaningful with --delete."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume the last scan that was cancelled before it finished, instead of starting a new one",
@@ -251,18 +261,20 @@ def main(argv: list[str] | None = None) -> int:
         print("\nRun 'file-sorter --resume' to continue this scan where it left off.")
 
     if args.delete and groups:
-        _delete_duplicates(groups, skip_confirmation=args.yes)
+        _delete_duplicates(groups, skip_confirmation=args.yes, dry_run=args.dry_run)
 
     return 0
 
 
-def _delete_duplicates(groups: list[DuplicateGroup], *, skip_confirmation: bool) -> None:
+def _delete_duplicates(groups: list[DuplicateGroup], *, skip_confirmation: bool, dry_run: bool = False) -> None:
     # Same convention as the GUI: keep the first file in each group, delete the rest.
     to_delete = [(group, path) for group in groups for path in group.paths[1:]]
     if not to_delete:
         return
 
-    if not skip_confirmation:
+    if dry_run:
+        print("\nDry run -- nothing will actually be deleted.")
+    elif not skip_confirmation:
         try:
             answer = input(f"\nMove {len(to_delete)} file(s) to Trash? [y/N] ").strip().lower()
         except EOFError:
@@ -281,20 +293,27 @@ def _delete_duplicates(groups: list[DuplicateGroup], *, skip_confirmation: bool)
                 failures.append(f"{path}: could not verify against kept file: {exc}")
                 continue
             if not verified:
+                skip_verb = "would be skipped" if dry_run else "skipped"
                 failures.append(
                     f"{path}: not verified as an actual duplicate of the kept file -- "
-                    "skipped rather than risk deleting a non-duplicate"
+                    f"{skip_verb} rather than risk deleting a non-duplicate"
                 )
                 continue
+        if dry_run:
+            print(f"  would delete: {path}")
+            deleted += 1
+            continue
         try:
             send2trash(str(path))
             deleted += 1
         except OSError as exc:
             failures.append(f"{path}: {exc}")
 
-    print(f"\nDeleted {deleted} file(s) to Trash.")
+    verb = "Would delete" if dry_run else "Deleted"
+    print(f"\n{verb} {deleted} file(s) to Trash.")
     if failures:
-        print(f"{len(failures)} file(s) were not deleted:")
+        label = "would not be deleted" if dry_run else "were not deleted"
+        print(f"{len(failures)} file(s) {label}:")
         for line in failures:
             print(f"  {line}")
 

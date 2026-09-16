@@ -68,7 +68,8 @@ rest are moved to the Trash (via `send2trash`, never permanently deleted):
 
 ```bash
 file-sorter ~/Downloads --delete
-file-sorter ~/Downloads --delete --yes   # skip the "are you sure?" prompt
+file-sorter ~/Downloads --delete --yes       # skip the "are you sure?" prompt
+file-sorter ~/Downloads --delete --dry-run   # preview what would be deleted, delete nothing
 ```
 
 A large-file group that wasn't fully verified during the scan (see
