@@ -15,8 +15,17 @@ from send2trash import send2trash
 from .dedupe import LARGE_FILE_THRESHOLD, DuplicateGroup, default_workers, files_equal, find_duplicates
 from .folders import FolderGroup
 from .formatting import human_size
-from .history import export_history, import_history, load_history, record_run
-from .resume import clear_resume_state, latest_resume_run_id, load_resume_state, resumable_run_ids, save_resume_state
+from .store import (
+    clear_resume_state,
+    export_history,
+    import_history,
+    latest_resume_run_id,
+    load_history,
+    load_resume_state,
+    record_run,
+    resumable_run_ids,
+    save_resume_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +262,13 @@ def main(argv: list[str] | None = None) -> int:
         cancel_event.set()
         print("\nCancelling... (press Ctrl+C again to force quit)", file=sys.stderr)
 
+    # Reused from --resume when picking up a stopped run, or freshly minted
+    # otherwise, so mid-scan checkpoints (see on_checkpoint below) have
+    # somewhere to save to from the very start -- not just once the scan
+    # is actually cancelled -- and a hard crash or killed process loses at
+    # most a checkpoint interval's worth of work on a large scan.
+    run_id = resume_run_id if resume_run_id is not None else str(time.time())
+
     previous_handler = signal.signal(signal.SIGINT, handle_sigint)
     start = time.monotonic()
     try:
@@ -263,16 +279,20 @@ def main(argv: list[str] | None = None) -> int:
             resume_state=resume_state,
             workers=args.threads,
             large_file_threshold=args.large_threshold,
+            on_checkpoint=lambda state: save_resume_state(run_id, state),
         )
     finally:
         signal.signal(signal.SIGINT, previous_handler)
     duration = time.monotonic() - start
 
-    record = record_run(directories, result, duration)
-    if resume_run_id is not None:
-        clear_resume_state(resume_run_id)
+    record_run(directories, result, duration, run_id=run_id)
+    # Whatever checkpoint(s) this run saved along the way (or, if resuming,
+    # the older stopped run it consumed) are done with now -- either the
+    # scan finished, or it's cancelled again and a fresh resume state is
+    # saved right below under this same id.
+    clear_resume_state(run_id)
     if result.cancelled and result.resume_state is not None:
-        save_resume_state(str(record.timestamp), result.resume_state)
+        save_resume_state(run_id, result.resume_state)
 
     folder_groups = result.folder_groups
     if args.min_size:

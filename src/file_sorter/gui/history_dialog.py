@@ -17,8 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..formatting import human_size
-from ..history import RunRecord, export_history, import_history, load_history
-from ..resume import load_resume_state, resumable_run_ids
+from ..store import RunRecord, export_history, import_history, load_history, load_resume_state, resumable_run_ids
 
 
 class HistoryDialog(QDialog):

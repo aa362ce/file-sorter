@@ -11,16 +11,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
-from .resume import ResumeState
+from .store import ResumeState
 
 if TYPE_CHECKING:
     from .folders import FolderGroup
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
+CheckpointCallback = Callable[[ResumeState], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
 LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
+
+# How many files a hash/confirm stage processes between checkpoint saves
+# (see `find_duplicates`'s `on_checkpoint`) -- frequent enough that a
+# crash or power loss partway through hashing a huge drive loses at most
+# this many files' worth of work, infrequent enough that the checkpoint
+# write itself (a single-row SQLite UPSERT, see `store.save_resume_state`)
+# never becomes the bottleneck.
+CHECKPOINT_INTERVAL = 2000
 
 T = TypeVar("T")
 K = TypeVar("K")
@@ -127,6 +136,7 @@ def _group_by_content(
     show_progress: bool,
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
+    on_checkpoint: Optional[Callable[[dict[str, list[Path]], list[Path], list[Path]], None]] = None,
 ) -> tuple[dict[str, list[Path]], list[Path], list[Path], bool]:
     """Confirm which files within each bucket (files that already share a
     size and a partial hash from earlier stages) are true duplicates, by
@@ -154,6 +164,8 @@ def _group_by_content(
         progress.update()
         if on_progress:
             on_progress(stage_label, progress.count, total)
+        if on_checkpoint and len(processed) % CHECKPOINT_INTERVAL == 0:
+            on_checkpoint(result, processed, skipped)
 
     def compare(representative: Path, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
         try:
@@ -227,6 +239,7 @@ def _hash_parallel(
     show_progress: bool,
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
+    on_checkpoint: Optional[Callable[[dict[K, list[Path]], list[Path], list[Path]], None]] = None,
 ) -> tuple[dict[K, list[Path]], list[Path], list[Path], bool]:
     """Hash `items` into buckets keyed by `key_of`, spreading the reads and
     hashing across a thread pool of `workers` threads.
@@ -255,13 +268,14 @@ def _hash_parallel(
             logger.debug("Skipping unreadable file %s: %s", path, error)
             skipped.append(path)
             processed.append(path)
-            return
-        assert digest is not None
-        result[key_of(item, digest)].append(path)
-        processed.append(path)
-        progress.update()
-        if on_progress:
-            on_progress(stage_label, progress.count, total)
+        else:
+            result[key_of(item, digest)].append(path)
+            processed.append(path)
+            progress.update()
+            if on_progress:
+                on_progress(stage_label, progress.count, total)
+        if on_checkpoint and len(processed) % CHECKPOINT_INTERVAL == 0:
+            on_checkpoint(result, processed, skipped)
 
     if workers <= 1 or total <= 1:
         for item in items:
@@ -331,6 +345,7 @@ def find_duplicates(
     resume_state: Optional[ResumeState] = None,
     workers: Optional[int] = None,
     large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
+    on_checkpoint: Optional[CheckpointCallback] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -398,6 +413,17 @@ def find_duplicates(
     right before actually deleting one of its files. Pass 0/None to
     disable deferral and always confirm during the scan, regardless of
     size. Defaults to `LARGE_FILE_THRESHOLD` (500MB).
+
+    `on_checkpoint(state)`, if given, is called periodically (every
+    `CHECKPOINT_INTERVAL` files) during stage 2 and stage 3 with a
+    `ResumeState` snapshot of progress so far -- the same shape as
+    `ScanResult.resume_state`, just saved *during* the scan instead of
+    only once it's cancelled. This is how a caller persists progress
+    (e.g. `store.save_resume_state`) incrementally for a scan large
+    enough that losing it all to a crash or power loss, rather than just
+    a clean Cancel, would be costly. Stage 1 (the directory walk) has no
+    checkpoint of its own -- a `resume_state` with stage "scanning" isn't
+    resumable either (see above), so there'd be nothing to do with one.
     """
     directories = list(directories)
     skipped: list[Path] = []
@@ -469,6 +495,29 @@ def find_duplicates(
             else:
                 logger.info("Stage 2/3: quick-hashing %d candidate file(s)", len(partial_candidates))
 
+        def _checkpoint_stage2(
+            partial_result: dict[tuple[int, str], list[Path]], processed_so_far: list[Path], skipped_so_far: list[Path]
+        ) -> None:
+            if on_checkpoint is None:
+                return
+            combined_partial: dict[tuple[int, str], list[Path]] = defaultdict(
+                list, {key: list(paths) for key, paths in by_partial.items()}
+            )
+            for key, paths in partial_result.items():
+                combined_partial[key].extend(paths)
+            on_checkpoint(
+                ResumeState(
+                    directories=[str(d) for d in directories],
+                    stage="quick_hash",
+                    by_size={str(size): [str(p) for p in paths] for size, paths in by_size.items()},
+                    by_partial={
+                        _partial_key(*key): [str(p) for p in paths] for key, paths in combined_partial.items()
+                    },
+                    processed=[str(p) for p in processed_so_far],
+                    skipped=[str(p) for p in skipped] + [str(p) for p in skipped_so_far],
+                )
+            )
+
         hashed, processed_stage2, newly_skipped, stage_cancelled = _hash_parallel(
             partial_candidates,
             path_of=lambda item: item[1],
@@ -479,6 +528,7 @@ def find_duplicates(
             show_progress=show_progress,
             on_progress=on_progress,
             is_cancelled=is_cancelled,
+            on_checkpoint=_checkpoint_stage2,
         )
         for key, paths in hashed.items():
             by_partial[key].extend(paths)
@@ -543,6 +593,27 @@ def find_duplicates(
             )
         else:
             logger.info("Stage 3/3: confirming %d candidate file(s) by content", full_total)
+
+        def _checkpoint_stage3(
+            partial_result: dict[str, list[Path]], processed_so_far: list[Path], skipped_so_far: list[Path]
+        ) -> None:
+            if on_checkpoint is None:
+                return
+            combined_full: dict[str, list[Path]] = defaultdict(list, {key: list(paths) for key, paths in by_full.items()})
+            for key, paths in partial_result.items():
+                combined_full[key].extend(paths)
+            on_checkpoint(
+                ResumeState(
+                    directories=[str(d) for d in directories],
+                    stage="full_hash",
+                    by_size={str(size): [str(p) for p in paths] for size, paths in by_size.items()},
+                    by_partial={_partial_key(*key): [str(p) for p in paths] for key, paths in by_partial.items()},
+                    by_full={h: [str(p) for p in paths] for h, paths in combined_full.items()},
+                    processed=[str(p) for p in processed_so_far],
+                    skipped=[str(p) for p in skipped] + [str(p) for p in skipped_so_far],
+                )
+            )
+
         hashed, processed_stage3, newly_skipped, stage_cancelled = _group_by_content(
             buckets,
             workers=workers,
@@ -550,6 +621,7 @@ def find_duplicates(
             show_progress=show_progress,
             on_progress=on_progress,
             is_cancelled=is_cancelled,
+            on_checkpoint=_checkpoint_stage3,
         )
         for key, paths in hashed.items():
             by_full[key].extend(paths)
