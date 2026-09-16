@@ -11,16 +11,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
-from .resume import ResumeState
+from .store import CheckpointDelta, ResumeState
 
 if TYPE_CHECKING:
     from .folders import FolderGroup
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
+CheckpointCallback = Callable[[CheckpointDelta], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
 LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
+
+# How many files a hash/confirm stage processes between checkpoint saves
+# (see `find_duplicates`'s `on_checkpoint`) -- frequent enough that a
+# crash or power loss partway through hashing a huge drive loses at most
+# this many files' worth of work, infrequent enough that the checkpoint
+# write itself (a single-row SQLite UPSERT, see `store.save_resume_state`)
+# never becomes the bottleneck.
+CHECKPOINT_INTERVAL = 2000
 
 T = TypeVar("T")
 K = TypeVar("K")
@@ -35,42 +44,92 @@ def default_workers() -> int:
     return os.cpu_count() or 1
 
 
-def iter_files(directories: Iterable[Path]) -> Iterator[Path]:
-    """Recursively yield every file under `directories`, following directory
-    symlinks (e.g. an iCloud/Dropbox-synced folder, or a dotfiles symlink)
-    but never re-entering a real directory already visited -- which both
-    prevents symlink-cycle hangs and avoids the same file being reported
-    twice through two different symlinked paths.
+def _dir_key(st: os.stat_result) -> str:
+    return f"{st.st_dev}:{st.st_ino}"
 
-    File symlinks are skipped: a symlink to a file elsewhere isn't a real
-    duplicate on disk, it's the same file, so counting it as a "copy" would
-    be misleading.
+
+def _walk_checkpointed(
+    directories: Iterable[Path],
+    *,
+    completed_dirs: set[str],
+    already_seen: set[Path],
+) -> Iterator[tuple[str, object]]:
+    """Recursively yield every file under `directories`, resumable at
+    directory granularity -- used for stage 1's own checkpointing (see
+    `find_duplicates`'s `on_checkpoint`).
+
+    Follows directory symlinks (e.g. an iCloud/Dropbox-synced folder, or a
+    dotfiles symlink) but never re-enters a real directory already
+    visited, which both prevents symlink-cycle hangs and avoids the same
+    file being reported twice through two different symlinked paths. File
+    symlinks are skipped: a symlink to a file elsewhere isn't a real
+    duplicate on disk, it's the same file, so counting it as a "copy"
+    would be misleading.
+
+    Explicit-stack DFS rather than recursion, so a directory's completion
+    can be observed as an event (yielded once every entry in it -- files
+    and, recursively, subdirectories -- has been fully processed) instead
+    of only implicitly by a generator frame returning.
+
+    Yields:
+    - `("file", Path)` for each file found, except one already in
+      `already_seen` (paths already recorded from a checkpoint before a
+      crash) -- skipping those is what keeps a resumed walk from
+      double-counting a directory that had only partly been flushed.
+    - `("dir_done", key)` once a directory -- identified by `key`, a
+      "dev:ino" string stable across a resume even if the path is a
+      symlink -- and everything under it is fully processed.
+
+    Any directory whose key is already in `completed_dirs` (persisted by
+    an earlier checkpoint) is skipped entirely, without being scanned
+    again -- the cost of resuming is bounded by what's still pending, not
+    by however much of the tree is already done.
     """
     visited: set[tuple[int, int]] = set()
-    for directory in directories:
-        yield from _walk(directory, visited)
+    stack: list[tuple[Iterator[os.DirEntry], str]] = []
 
-
-def _walk(directory: Path, visited: set[tuple[int, int]]) -> Iterator[Path]:
-    try:
-        st = os.stat(directory)
-        key = (st.st_dev, st.st_ino)
-        if key in visited:
+    def try_push(directory: Path, st: os.stat_result) -> None:
+        ino_key = (st.st_dev, st.st_ino)
+        if ino_key in visited:
             return
-        visited.add(key)
-        entries = list(os.scandir(directory))
-    except OSError:
-        return
+        visited.add(ino_key)
+        key = _dir_key(st)
+        if key in completed_dirs:
+            return
+        try:
+            entries = iter(list(os.scandir(directory)))
+        except OSError:
+            return
+        stack.append((entries, key))
 
-    for entry in entries:
+    for root in directories:
+        try:
+            st = os.stat(root)
+        except OSError:
+            continue
+        try_push(root, st)
+
+    while stack:
+        entries, key = stack[-1]
+        entry = next(entries, None)
+        if entry is None:
+            stack.pop()
+            yield ("dir_done", key)
+            continue
         try:
             is_symlink = entry.is_symlink()
             if is_symlink and not entry.is_dir(follow_symlinks=True):
                 continue
             if entry.is_dir(follow_symlinks=True):
-                yield from _walk(Path(entry.path), visited)
+                # entry.stat() reuses the stat info scandir() already
+                # fetched for a real (non-symlink) subdirectory instead of
+                # issuing a second syscall for it -- a real cost at the
+                # scale of a whole drive's directory tree.
+                try_push(Path(entry.path), entry.stat())
             elif not is_symlink and entry.is_file(follow_symlinks=False):
-                yield Path(entry.path)
+                path = Path(entry.path)
+                if path not in already_seen:
+                    yield ("file", path)
         except OSError:
             continue
 
@@ -127,6 +186,7 @@ def _group_by_content(
     show_progress: bool,
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
+    on_checkpoint: Optional[Callable[[list[tuple[str, Path]], list[Path]], None]] = None,
 ) -> tuple[dict[str, list[Path]], list[Path], list[Path], bool]:
     """Confirm which files within each bucket (files that already share a
     size and a partial hash from earlier stages) are true duplicates, by
@@ -141,6 +201,15 @@ def _group_by_content(
     split into separate groups. A confirmed group's identifying hash is
     computed from its representative only, once -- files that turn out not
     to match anything are never hashed at all.
+
+    `on_checkpoint(new_entries, new_skipped)`, if given, is called every
+    `CHECKPOINT_INTERVAL` files with only what's new *since the last call*
+    (as (digest, path) pairs newly confirmed into `result`, and paths newly
+    added to `skipped`) -- not the full accumulated state. That keeps each
+    checkpoint's cost proportional to `CHECKPOINT_INTERVAL` regardless of
+    how far into a huge scan it fires, instead of proportional to total
+    progress so far (which would make checkpointing itself the bottleneck
+    on a scan with millions of files).
     """
     result: dict[str, list[Path]] = {}
     processed: list[Path] = []
@@ -149,11 +218,31 @@ def _group_by_content(
     total = sum(len(bucket) for bucket in buckets)
     progress = Progress(stage_label, total=total, enabled=show_progress)
 
+    # Append-only logs mirroring `result`/`skipped`, used only to compute
+    # cheap since-last-checkpoint deltas below -- see `on_checkpoint` above.
+    checkpoint_log: list[tuple[str, Path]] = []
+    flushed_entries = 0
+    flushed_skipped = 0
+
+    def flush_checkpoint(*, force: bool = False) -> None:
+        nonlocal flushed_entries, flushed_skipped
+        if on_checkpoint is None:
+            return
+        if not force and len(processed) % CHECKPOINT_INTERVAL != 0:
+            return
+        new_entries = checkpoint_log[flushed_entries:]
+        new_skipped = skipped[flushed_skipped:]
+        if new_entries or new_skipped:
+            on_checkpoint(new_entries, new_skipped)
+        flushed_entries = len(checkpoint_log)
+        flushed_skipped = len(skipped)
+
     def mark_done(path: Path) -> None:
         processed.append(path)
         progress.update()
         if on_progress:
             on_progress(stage_label, progress.count, total)
+        flush_checkpoint()
 
     def compare(representative: Path, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
         try:
@@ -165,7 +254,13 @@ def _group_by_content(
         if not matched_others:
             return
         digest = _full_hash(representative)
-        result.setdefault(digest, []).extend([representative] + matched_others)
+        group_paths = [representative] + matched_others
+        result.setdefault(digest, []).extend(group_paths)
+        if on_checkpoint is not None:
+            # checkpoint_log duplicates what's already in `result`, purely
+            # to support the delta slicing in flush_checkpoint below -- not
+            # worth the extra memory when there's no checkpoint consumer.
+            checkpoint_log.extend((digest, p) for p in group_paths)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
     try:
@@ -212,6 +307,12 @@ def _group_by_content(
     finally:
         if pool is not None:
             pool.shutdown(wait=True)
+    # Unconditional final flush -- without it, whatever's landed in `result`
+    # since the last periodic checkpoint (including all of it, if this
+    # stage had fewer than CHECKPOINT_INTERVAL files total) would never
+    # reach `on_checkpoint`, leaving a resumed stage 3 with an incomplete
+    # `by_full` even though this stage otherwise finished cleanly.
+    flush_checkpoint(force=True)
     progress.close()
     return result, processed, skipped, cancelled
 
@@ -227,6 +328,7 @@ def _hash_parallel(
     show_progress: bool,
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
+    on_checkpoint: Optional[Callable[[list[tuple[K, Path]], list[Path]], None]] = None,
 ) -> tuple[dict[K, list[Path]], list[Path], list[Path], bool]:
     """Hash `items` into buckets keyed by `key_of`, spreading the reads and
     hashing across a thread pool of `workers` threads.
@@ -241,6 +343,11 @@ def _hash_parallel(
     between every single file, since a whole batch is already in flight
     together by the time it could be checked; whatever a batch finishes is
     kept before stopping.
+
+    `on_checkpoint(new_entries, new_skipped)`, if given, is called every
+    `CHECKPOINT_INTERVAL` files with only what's new since the last call --
+    see `_group_by_content`'s identical contract for why (checkpoint cost
+    must stay proportional to `CHECKPOINT_INTERVAL`, not to total progress).
     """
     result: dict[K, list[Path]] = defaultdict(list)
     processed: list[Path] = []
@@ -249,19 +356,42 @@ def _hash_parallel(
     total = len(items)
     progress = Progress(stage_label, total=total, enabled=show_progress)
 
+    checkpoint_log: list[tuple[K, Path]] = []
+    flushed_entries = 0
+    flushed_skipped = 0
+
+    def flush_checkpoint(*, force: bool = False) -> None:
+        nonlocal flushed_entries, flushed_skipped
+        if on_checkpoint is None:
+            return
+        if not force and len(processed) % CHECKPOINT_INTERVAL != 0:
+            return
+        new_entries = checkpoint_log[flushed_entries:]
+        new_skipped = skipped[flushed_skipped:]
+        if new_entries or new_skipped:
+            on_checkpoint(new_entries, new_skipped)
+        flushed_entries = len(checkpoint_log)
+        flushed_skipped = len(skipped)
+
     def record(item: T, digest: Optional[str], error: Optional[OSError]) -> None:
         path = path_of(item)
         if error is not None:
             logger.debug("Skipping unreadable file %s: %s", path, error)
             skipped.append(path)
             processed.append(path)
-            return
-        assert digest is not None
-        result[key_of(item, digest)].append(path)
-        processed.append(path)
-        progress.update()
-        if on_progress:
-            on_progress(stage_label, progress.count, total)
+        else:
+            key = key_of(item, digest)
+            result[key].append(path)
+            if on_checkpoint is not None:
+                # See _group_by_content's identical guard: checkpoint_log
+                # duplicates `result`, so skip it entirely with no
+                # checkpoint consumer to report the delta to.
+                checkpoint_log.append((key, path))
+            processed.append(path)
+            progress.update()
+            if on_progress:
+                on_progress(stage_label, progress.count, total)
+        flush_checkpoint()
 
     if workers <= 1 or total <= 1:
         for item in items:
@@ -272,6 +402,7 @@ def _hash_parallel(
                 record(item, hash_fn(path_of(item)), None)
             except OSError as exc:
                 record(item, None, exc)
+        flush_checkpoint(force=True)
         progress.close()
         return result, processed, skipped, cancelled
 
@@ -289,6 +420,7 @@ def _hash_parallel(
                 except OSError as exc:
                     record(item, None, exc)
             index += len(batch)
+    flush_checkpoint(force=True)
     progress.close()
     return result, processed, skipped, cancelled
 
@@ -322,6 +454,28 @@ def _partial_key(size: int, partial_hash: str) -> str:
     return f"{size}:{partial_hash}"
 
 
+def _resume_roots_match(resume_state: ResumeState, directories: list[Path]) -> bool:
+    """True if every one of `resume_state`'s recorded root identities
+    (`ResumeState.root_keys`) still matches -- i.e. nothing in `directories`
+    has quietly become a different filesystem since the state was saved.
+
+    A root missing from `root_keys` (e.g. a `ResumeState` saved before this
+    check existed) is treated as a pass for that root -- there's nothing to
+    compare against, so this can't newly break resuming an older state.
+    """
+    for directory in directories:
+        recorded = resume_state.root_keys.get(str(directory))
+        if recorded is None:
+            continue
+        try:
+            current = _dir_key(os.stat(directory))
+        except OSError:
+            return False
+        if current != recorded:
+            return False
+    return True
+
+
 def find_duplicates(
     directories: Iterable[Path],
     *,
@@ -331,6 +485,7 @@ def find_duplicates(
     resume_state: Optional[ResumeState] = None,
     workers: Optional[int] = None,
     large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
+    on_checkpoint: Optional[CheckpointCallback] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -370,18 +525,30 @@ def find_duplicates(
     this one left off instead of redoing already-hashed files.
 
     `resume_state`, if given, must describe a scan that was cancelled
-    partway through stage 2 or 3 (`stage` "quick_hash" or "full_hash") --
-    the results already computed for the interrupted stage and any earlier
-    stage are reused. For stage 2, only the files not yet processed at
-    cancellation time are (re)hashed. For stage 3, whole buckets (groups of
-    files sharing a size and partial hash) that were already fully
-    confirmed are skipped, but a bucket that was only partly resolved when
-    cancelled is redone from scratch rather than resumed file-by-file --
-    representative-based comparison doesn't carry over mid-bucket the way
-    independent per-file hashing did, and buckets are small enough that
-    this costs little. A `resume_state` with `stage` "scanning" (cancelled
-    during the directory walk, which has nothing worth resuming) is
-    equivalent to passing none.
+    partway through stage 1, 2 or 3. For a `stage` "scanning" resume (the
+    directory walk itself was interrupted), any directory already fully
+    walked (see `_walk_checkpointed`) is skipped entirely rather than
+    re-scanned, and files already recorded are never re-added -- so
+    resuming costs work proportional to what's still unwalked, not to
+    however much of a huge tree was already covered. For a `stage`
+    "quick_hash" or "full_hash" resume, the results already computed for
+    the interrupted stage and any earlier stage are reused: for stage 2,
+    only the files not yet processed at cancellation time are (re)hashed;
+    for stage 3, whole buckets (groups of files sharing a size and partial
+    hash) that were already fully confirmed are skipped, but a bucket that
+    was only partly resolved when cancelled is redone from scratch rather
+    than resumed file-by-file -- representative-based comparison doesn't
+    carry over mid-bucket the way independent per-file hashing did, and
+    buckets are small enough that this costs little.
+
+    Before trusting any of that, each directory in `directories` is
+    checked against `resume_state.root_keys` (see `_resume_roots_match`):
+    if one no longer matches the identity recorded when the state was
+    saved -- e.g. a different drive is now mounted at the same path --
+    `resume_state` is ignored entirely and the scan starts fresh, rather
+    than risk silently skipping a now-different directory's files or
+    comparing/hashing the wrong drive's content under paths that happen to
+    still exist.
 
     `workers` controls how many files stages 2 and 3 (the actual hashing)
     process concurrently via a thread pool, to take advantage of multiple
@@ -398,6 +565,18 @@ def find_duplicates(
     right before actually deleting one of its files. Pass 0/None to
     disable deferral and always confirm during the scan, regardless of
     size. Defaults to `LARGE_FILE_THRESHOLD` (500MB).
+
+    `on_checkpoint(delta)`, if given, is called periodically (every
+    `CHECKPOINT_INTERVAL` files, plus once whenever a directory finishes
+    during stage 1, and once more with whatever's left when a stage
+    finishes) throughout all three stages with a `CheckpointDelta` -- only
+    what's newly confirmed *since the previous call*, not the full state,
+    so a caller persisting it (via `store.checkpoint_progress`) pays a
+    cost proportional to `CHECKPOINT_INTERVAL`, not to how far into a scan
+    with millions of files it fires. This is how progress on a large scan
+    -- including the directory walk itself, for a drive large enough that
+    walking it is a substantial fraction of the whole scan -- survives a
+    crash or power loss, not just a clean Cancel.
     """
     directories = list(directories)
     skipped: list[Path] = []
@@ -408,9 +587,63 @@ def find_duplicates(
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
 
+    # `directories` never changes once a scan starts, and `by_size` is
+    # invariant from the moment stage 2 begins -- both are only worth
+    # sending once each, whichever checkpoint (stage 1, stage 2, or stage
+    # 3 if resuming straight into it) happens to fire first.
+    directories_sent = False
+
+    def _directories_once() -> Optional[list[str]]:
+        nonlocal directories_sent
+        if directories_sent:
+            return None
+        directories_sent = True
+        return [str(d) for d in directories]
+
+    by_size_sent = False
+
+    def _by_size_once() -> Optional[dict[str, list[str]]]:
+        nonlocal by_size_sent
+        if by_size_sent:
+            return None
+        by_size_sent = True
+        return {str(size): [str(p) for p in paths] for size, paths in by_size.items()}
+
+    root_keys_sent = False
+
+    def _root_keys_once() -> Optional[dict[str, str]]:
+        nonlocal root_keys_sent
+        if root_keys_sent:
+            return None
+        root_keys_sent = True
+        keys: dict[str, str] = {}
+        for directory in directories:
+            try:
+                keys[str(directory)] = _dir_key(os.stat(directory))
+            except OSError:
+                continue
+        return keys
+
+    if resume_state is not None and not _resume_roots_match(resume_state, directories):
+        # "dev:ino" isn't a permanent identity -- unplugging an external
+        # drive and later mounting a *different* one at the same path can
+        # reuse it. Trusting completed_dirs here would mean silently
+        # skipping a directory that only looks already-covered; trusting
+        # by_partial/by_full would mean hashing/comparing an unrelated
+        # drive's files under paths that happen to still exist. Either way
+        # a fresh scan is the only safe fallback.
+        logger.warning(
+            "Ignoring saved progress for %s -- a directory's identity has changed "
+            "since it was last checkpointed (e.g. a different drive now mounted at "
+            "the same path); starting a fresh scan instead of risking wrong results.",
+            ", ".join(str(d) for d in directories),
+        )
+        resume_state = None
+
     resume_stage = resume_state.stage if resume_state is not None else None
 
     by_size: dict[int, list[Path]] = defaultdict(list)
+    completed_dirs: set[str] = set()
     if resume_stage in ("quick_hash", "full_hash"):
         assert resume_state is not None
         for size_str, paths in resume_state.by_size.items():
@@ -418,25 +651,88 @@ def find_duplicates(
         skipped.extend(Path(p) for p in resume_state.skipped)
         logger.info("Resuming: stage 1/3 already done (%d distinct sizes)", len(by_size))
     else:
-        logger.info("Stage 1/3: scanning directories")
+        already_seen: set[Path] = set()
+        if resume_stage == "scanning":
+            assert resume_state is not None
+            for size_str, paths in resume_state.by_size.items():
+                by_size[int(size_str)] = [Path(p) for p in paths]
+            already_seen = {Path(p) for paths in by_size.values() for p in paths}
+            completed_dirs = set(resume_state.completed_dirs)
+            skipped.extend(Path(p) for p in resume_state.skipped)
+            already_seen |= set(skipped)
+            logger.info(
+                "Resuming stage 1/3: %d file(s) and %d completed director(y/ies) already known",
+                len(already_seen),
+                len(completed_dirs),
+            )
+        else:
+            logger.info("Stage 1/3: scanning directories")
+
+        # Delta-tracking for stage 1's own checkpoint, mirroring stage 2/3's
+        # pattern in _hash_parallel/_group_by_content -- see CheckpointDelta.
+        new_size_entries: list[tuple[str, str]] = []
+        new_completed: list[str] = []
+        new_skipped_stage1: list[Path] = []
+
+        def flush_stage1_checkpoint(*, force: bool = False) -> None:
+            nonlocal new_size_entries, new_completed, new_skipped_stage1
+            # A directory-heavy, file-sparse tree (many small/empty
+            # directories) could otherwise advance `progress.count` -- the
+            # only interval this used to check -- so slowly that a long
+            # run of completed directories never gets flushed at all.
+            due = force or progress.count % CHECKPOINT_INTERVAL == 0 or len(new_completed) >= CHECKPOINT_INTERVAL
+            if not due:
+                return
+            # Clear unconditionally once due, whether or not there's a
+            # caller to report to -- these lists otherwise duplicate
+            # everything already in by_size for the rest of the walk when
+            # on_checkpoint isn't given (e.g. find_duplicates called
+            # directly without checkpointing), roughly doubling stage 1's
+            # memory footprint on a large scan for no reason.
+            entries, completed, stage1_skipped = new_size_entries, new_completed, new_skipped_stage1
+            new_size_entries, new_completed, new_skipped_stage1 = [], [], []
+            if on_checkpoint is not None and (entries or completed or stage1_skipped):
+                on_checkpoint(
+                    CheckpointDelta(
+                        stage="scanning",
+                        new_entries=entries,
+                        new_skipped=[str(p) for p in stage1_skipped],
+                        new_completed_dirs=completed,
+                        directories=_directories_once(),
+                        root_keys=_root_keys_once(),
+                    )
+                )
+
         progress = Progress("Scanning", enabled=show_progress)
-        for path in iter_files(directories):
+        for kind, value in _walk_checkpointed(directories, completed_dirs=completed_dirs, already_seen=already_seen):
             if is_cancelled():
                 cancelled = True
                 cancelled_stage = "scanning"
                 break
+            if kind == "dir_done":
+                dir_key = value
+                completed_dirs.add(dir_key)
+                new_completed.append(dir_key)
+                flush_stage1_checkpoint()
+                continue
+            path = value
             try:
                 size = path.stat().st_size
             except OSError as exc:
                 logger.debug("Skipping unreadable file %s: %s", path, exc)
                 skipped.append(path)
+                new_skipped_stage1.append(path)
+                flush_stage1_checkpoint()
                 continue
             by_size[size].append(path)
+            new_size_entries.append((str(size), str(path)))
             progress.update()
             if on_progress:
                 on_progress("Scanning", progress.count, None)
+            flush_stage1_checkpoint()
+        flush_stage1_checkpoint(force=True)
         progress.close()
-        logger.info("Stage 1/3 done: %d files, %d distinct sizes", progress.count, len(by_size))
+        logger.info("Stage 1/3 done: %d file(s) found this attempt, %d distinct sizes", progress.count, len(by_size))
 
     by_partial: dict[tuple[int, str], list[Path]] = defaultdict(list)
     processed_stage2: list[Path] = []
@@ -469,6 +765,20 @@ def find_duplicates(
             else:
                 logger.info("Stage 2/3: quick-hashing %d candidate file(s)", len(partial_candidates))
 
+        def _checkpoint_stage2(new_entries: list[tuple[tuple[int, str], Path]], new_skipped: list[Path]) -> None:
+            if on_checkpoint is None:
+                return
+            on_checkpoint(
+                CheckpointDelta(
+                    stage="quick_hash",
+                    new_entries=[(_partial_key(*key), str(p)) for key, p in new_entries],
+                    new_skipped=[str(p) for p in new_skipped],
+                    by_size=_by_size_once(),
+                    directories=_directories_once(),
+                    root_keys=_root_keys_once(),
+                )
+            )
+
         hashed, processed_stage2, newly_skipped, stage_cancelled = _hash_parallel(
             partial_candidates,
             path_of=lambda item: item[1],
@@ -479,6 +789,7 @@ def find_duplicates(
             show_progress=show_progress,
             on_progress=on_progress,
             is_cancelled=is_cancelled,
+            on_checkpoint=_checkpoint_stage2,
         )
         for key, paths in hashed.items():
             by_partial[key].extend(paths)
@@ -543,6 +854,21 @@ def find_duplicates(
             )
         else:
             logger.info("Stage 3/3: confirming %d candidate file(s) by content", full_total)
+
+        def _checkpoint_stage3(new_entries: list[tuple[str, Path]], new_skipped: list[Path]) -> None:
+            if on_checkpoint is None:
+                return
+            on_checkpoint(
+                CheckpointDelta(
+                    stage="full_hash",
+                    new_entries=[(digest, str(p)) for digest, p in new_entries],
+                    new_skipped=[str(p) for p in new_skipped],
+                    by_size=_by_size_once(),
+                    directories=_directories_once(),
+                    root_keys=_root_keys_once(),
+                )
+            )
+
         hashed, processed_stage3, newly_skipped, stage_cancelled = _group_by_content(
             buckets,
             workers=workers,
@@ -550,6 +876,7 @@ def find_duplicates(
             show_progress=show_progress,
             on_progress=on_progress,
             is_cancelled=is_cancelled,
+            on_checkpoint=_checkpoint_stage3,
         )
         for key, paths in hashed.items():
             by_full[key].extend(paths)
@@ -575,6 +902,12 @@ def find_duplicates(
     new_resume_state: Optional[ResumeState] = None
     if cancelled:
         logger.info("Cancelled: %d duplicate group(s) confirmed so far, %d file(s) skipped", len(groups), len(skipped))
+        final_root_keys: dict[str, str] = {}
+        for directory in directories:
+            try:
+                final_root_keys[str(directory)] = _dir_key(os.stat(directory))
+            except OSError:
+                continue
         if cancelled_stage in ("quick_hash", "full_hash"):
             new_resume_state = ResumeState(
                 directories=[str(d) for d in directories],
@@ -584,12 +917,16 @@ def find_duplicates(
                 by_full={h: [str(p) for p in paths] for h, paths in by_full.items()},
                 processed=[str(p) for p in (processed_stage2 if cancelled_stage == "quick_hash" else processed_stage3)],
                 skipped=[str(p) for p in skipped],
+                root_keys=final_root_keys,
             )
         else:
             new_resume_state = ResumeState(
                 directories=[str(d) for d in directories],
                 stage="scanning",
+                by_size={str(size): [str(p) for p in paths] for size, paths in by_size.items()},
+                completed_dirs=sorted(completed_dirs),
                 skipped=[str(p) for p in skipped],
+                root_keys=final_root_keys,
             )
     else:
         logger.info("Done: %d duplicate group(s), %d file(s) skipped", len(groups), len(skipped))

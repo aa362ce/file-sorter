@@ -198,3 +198,40 @@ Selected", which repopulates the directory list and continues that scan
 -- independently of "Resume Last Run" on the main window, which always
 targets the most recently stopped run. "Export..." / "Import..." use the
 same JSON file as `--export-history` / `--import-history`.
+
+## Releasing prebuilt executables
+
+`.github/workflows/release-build.yml` builds standalone CLI and GUI
+executables for both Windows and macOS with PyInstaller and attaches them
+to a GitHub Release -- no Python install needed to run them.
+
+To cut a release: push a tag matching `v*` (e.g. `git tag v0.2.0 && git
+push origin v0.2.0`). This builds on both platforms and creates a GitHub
+Release for that tag with all four files attached. To build without
+releasing (e.g. to sanity-check a change), run the workflow manually from
+the Actions tab (`workflow_dispatch`) -- it still uploads the executables
+as workflow artifacts, just without creating a release.
+
+Artifacts per platform:
+
+- **Windows**: `file-sorter.exe` (CLI), `file-sorter-gui.exe` (GUI)
+- **macOS**: `file-sorter-macos` (CLI), `file-sorter-gui-macos.zip`
+  (GUI `.app` bundle, zipped since GitHub release assets can't be
+  directories)
+
+Neither build is code-signed or notarized (that needs a paid Apple
+Developer account for macOS, and a code-signing certificate for Windows),
+so:
+
+- **macOS** will refuse to open `file-sorter-gui.app` with an
+  "unidentified developer" warning. After unzipping, either right-click
+  the app and choose "Open" (prompts once, then remembers), or run `xattr
+  -cr file-sorter-gui.app` first to strip the quarantine flag that
+  triggers the warning.
+- **Windows** SmartScreen may show a similar "Windows protected your PC"
+  prompt the first time; "More info" -> "Run anyway" bypasses it.
+
+The macOS build only targets the runner's native architecture (Apple
+Silicon/arm64, since GitHub's `macos-latest` runners moved off Intel) --
+it isn't a universal2 binary. It should still run on an Intel Mac via
+Rosetta 2, but hasn't been verified there.

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -28,8 +29,14 @@ from send2trash import send2trash
 from ..dedupe import DuplicateGroup, ScanResult, files_equal
 from ..folders import FolderGroup
 from ..formatting import human_size
-from ..history import record_run
-from ..resume import ResumeState, clear_resume_state, latest_resume_run_id, load_resume_state, save_resume_state
+from ..store import (
+    ResumeState,
+    clear_resume_state,
+    latest_resume_run_id,
+    load_resume_state,
+    record_run,
+    save_resume_state,
+)
 from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
@@ -47,6 +54,7 @@ class MainWindow(QMainWindow):
         self._scan_directories: list[Path] = []
         self._scan_start: Optional[float] = None
         self._resume_run_id: Optional[str] = None
+        self._run_id: Optional[str] = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -90,6 +98,8 @@ class MainWindow(QMainWindow):
 
         self.results_tree = QTreeWidget()
         self.results_tree.setHeaderLabels(["File", "Size"])
+        self.results_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.results_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.results_tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.results_tree, 1)
 
@@ -136,8 +146,13 @@ class MainWindow(QMainWindow):
         self._scan_directories = directories
         self._scan_start = time.monotonic()
         self._resume_run_id = run_id
+        # The id checkpoints are saved under for *this* attempt -- reused
+        # from `run_id` when resuming a stopped run, or freshly minted for
+        # a new scan so a crash partway through (not just a clean Cancel)
+        # still leaves recoverable progress behind.
+        self._run_id = run_id if run_id is not None else str(time.time())
 
-        self._worker = ScanWorker(directories, resume_state=resume_state)
+        self._worker = ScanWorker(directories, resume_state=resume_state, run_id=self._run_id)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_scan.connect(self._on_scan_finished)
         self._worker.start()
@@ -195,19 +210,20 @@ class MainWindow(QMainWindow):
             self._add_group(group, confirmed_folder_dirs)
 
         duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
-        record = record_run(self._scan_directories, result, duration)
+        record_run(self._scan_directories, result, duration, run_id=self._run_id)
 
-        # Whichever stopped run this attempt just consumed (if any) is done
-        # with -- either it finished, or it got cancelled again and a fresh
-        # resume state was saved below under this new record's own id. That
-        # never touches *other* stopped runs still sitting in history, so
-        # each stays independently resumable.
-        if self._resume_run_id is not None:
-            clear_resume_state(self._resume_run_id)
-            self._resume_run_id = None
+        # Whichever stopped run this attempt just consumed (if any), and any
+        # mid-scan checkpoint saved under this attempt's own id, are both
+        # done with now -- either the scan finished, or it got cancelled
+        # again and a fresh resume state is saved below under the same id.
+        # This never touches *other* stopped runs still sitting in history,
+        # so each stays independently resumable.
+        for stale_id in {self._resume_run_id, self._run_id} - {None}:
+            clear_resume_state(stale_id)
+        self._resume_run_id = None
 
         if result.cancelled and result.resume_state is not None:
-            save_resume_state(str(record.timestamp), result.resume_state)
+            save_resume_state(self._run_id, result.resume_state)
         self.resume_btn.setEnabled(latest_resume_run_id() is not None)
 
         folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
