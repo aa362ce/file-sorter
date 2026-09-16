@@ -119,18 +119,31 @@ a second press force-quits immediately.
 
 ### Resuming a stopped scan
 
-A cancelled scan saves its progress (which files it had already hashed)
-to `~/.file-sorter/resume_state.json`. Pick up where it left off with:
+A cancelled scan saves its progress (which files it had already hashed or
+confirmed) to `~/.file-sorter/resume_states.json`, keyed to that specific
+run in history -- so several stopped scans (e.g. one per drive) can sit
+there independently resumable at once; finishing or resuming one never
+affects the others. Pick up the most recently stopped one with:
 
 ```bash
 file-sorter --resume
 ```
 
-This reuses the same directories and skips re-hashing files that were
-already confirmed or ruled out, so only the files that hadn't been
-reached yet get (re)processed. `--resume` doesn't take directory
-arguments -- it always continues the most recently stopped scan. A scan
-that finishes normally (not cancelled) clears any saved resume state.
+`--history` numbers every run, newest first, and marks cancelled ones
+that still have saved progress as `resumable` -- pass that number to
+resume a specific past run instead of just the latest:
+
+```bash
+file-sorter --history
+file-sorter --resume 3
+```
+
+Resuming reuses the same directories and skips re-hashing/re-confirming
+files that were already handled, so only what hadn't been reached yet
+gets (re)processed. `--resume` doesn't take directory arguments. A run's
+saved progress is cleared once it's resumed (whether that attempt then
+finishes or gets cancelled again, in which case the new attempt gets its
+own saved state under its own history entry).
 
 ### History
 
@@ -179,5 +192,9 @@ separately checkable, so there's never a conflict between "keep this
 folder" and "delete this one file inside it." An *unverified* (large-file)
 folder's row is informational only, and its files remain regular,
 individually checkable duplicate groups instead. "History" shows past
-runs from both the GUI and the CLI, with "Export..." / "Import..." buttons
-for the same JSON file used by `--export-history` / `--import-history`.
+runs from both the GUI and the CLI; a cancelled run with saved progress
+is labeled "Cancelled (resumable)" and selecting it enables "Resume
+Selected", which repopulates the directory list and continues that scan
+-- independently of "Resume Last Run" on the main window, which always
+targets the most recently stopped run. "Export..." / "Import..." use the
+same JSON file as `--export-history` / `--import-history`.

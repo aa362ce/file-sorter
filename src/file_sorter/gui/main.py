@@ -29,7 +29,7 @@ from ..dedupe import DuplicateGroup, ScanResult, files_equal
 from ..folders import FolderGroup
 from ..formatting import human_size
 from ..history import record_run
-from ..resume import ResumeState, clear_resume_state, load_resume_state, save_resume_state
+from ..resume import ResumeState, clear_resume_state, latest_resume_run_id, load_resume_state, save_resume_state
 from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
         self._updating_check = False
         self._scan_directories: list[Path] = []
         self._scan_start: Optional[float] = None
+        self._resume_run_id: Optional[str] = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -74,7 +75,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.resume_btn = QPushButton("Resume Last Run")
         self.resume_btn.clicked.connect(self._resume_scan)
-        self.resume_btn.setEnabled(load_resume_state() is not None)
+        self.resume_btn.setEnabled(latest_resume_run_id() is not None)
         self.history_btn = QPushButton("History")
         self.history_btn.clicked.connect(self._show_history)
         self.progress_bar = QProgressBar()
@@ -118,7 +119,7 @@ class MainWindow(QMainWindow):
 
     # -- scanning -------------------------------------------------------
 
-    def _start_scan(self, resume_state: Optional[ResumeState] = None) -> None:
+    def _start_scan(self, resume_state: Optional[ResumeState] = None, run_id: Optional[str] = None) -> None:
         directories = [Path(self.dir_list.item(i).text()) for i in range(self.dir_list.count())]
         if not directories:
             QMessageBox.information(self, "No directories", "Add at least one directory to scan.")
@@ -134,6 +135,7 @@ class MainWindow(QMainWindow):
 
         self._scan_directories = directories
         self._scan_start = time.monotonic()
+        self._resume_run_id = run_id
 
         self._worker = ScanWorker(directories, resume_state=resume_state)
         self._worker.progress.connect(self._on_progress)
@@ -141,7 +143,8 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def _resume_scan(self) -> None:
-        resume_state = load_resume_state()
+        run_id = latest_resume_run_id()
+        resume_state = load_resume_state(run_id) if run_id is not None else None
         if resume_state is None:
             QMessageBox.information(self, "Nothing to resume", "There's no stopped run to resume.")
             self.resume_btn.setEnabled(False)
@@ -150,7 +153,13 @@ class MainWindow(QMainWindow):
         self.dir_list.clear()
         for directory in resume_state.directories:
             self.dir_list.addItem(directory)
-        self._start_scan(resume_state=resume_state)
+        self._start_scan(resume_state=resume_state, run_id=run_id)
+
+    def _resume_from_history(self, run_id: str, resume_state: ResumeState) -> None:
+        self.dir_list.clear()
+        for directory in resume_state.directories:
+            self.dir_list.addItem(directory)
+        self._start_scan(resume_state=resume_state, run_id=run_id)
 
     def _cancel_scan(self) -> None:
         if self._worker is not None:
@@ -186,14 +195,20 @@ class MainWindow(QMainWindow):
             self._add_group(group, confirmed_folder_dirs)
 
         duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
-        record_run(self._scan_directories, result, duration)
+        record = record_run(self._scan_directories, result, duration)
+
+        # Whichever stopped run this attempt just consumed (if any) is done
+        # with -- either it finished, or it got cancelled again and a fresh
+        # resume state was saved below under this new record's own id. That
+        # never touches *other* stopped runs still sitting in history, so
+        # each stays independently resumable.
+        if self._resume_run_id is not None:
+            clear_resume_state(self._resume_run_id)
+            self._resume_run_id = None
 
         if result.cancelled and result.resume_state is not None:
-            save_resume_state(result.resume_state)
-            self.resume_btn.setEnabled(True)
-        else:
-            clear_resume_state()
-            self.resume_btn.setEnabled(False)
+            save_resume_state(str(record.timestamp), result.resume_state)
+        self.resume_btn.setEnabled(latest_resume_run_id() is not None)
 
         folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
@@ -206,7 +221,9 @@ class MainWindow(QMainWindow):
         self._worker = None
 
     def _show_history(self) -> None:
-        HistoryDialog(self).exec()
+        dialog = HistoryDialog(self)
+        dialog.resume_requested.connect(self._resume_from_history)
+        dialog.exec()
 
     # -- results tree -----------------------------------------------------
 

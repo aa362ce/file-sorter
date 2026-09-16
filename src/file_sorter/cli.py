@@ -8,6 +8,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from send2trash import send2trash
 
@@ -15,7 +16,7 @@ from .dedupe import LARGE_FILE_THRESHOLD, DuplicateGroup, default_workers, files
 from .folders import FolderGroup
 from .formatting import human_size
 from .history import export_history, import_history, load_history, record_run
-from .resume import clear_resume_state, load_resume_state, save_resume_state
+from .resume import clear_resume_state, latest_resume_run_id, load_resume_state, resumable_run_ids, save_resume_state
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--resume",
-        action="store_true",
-        help="Resume the last scan that was cancelled before it finished, instead of starting a new one",
+        nargs="?",
+        const="LAST",
+        default=None,
+        metavar="N",
+        help=(
+            "Resume a scan that was cancelled before it finished, instead of starting a new one. "
+            "With no value, resumes the most recently stopped run; pass the # index shown by "
+            "--history (e.g. --resume 3) to resume a specific past stopped run instead."
+        ),
     )
     parser.add_argument(
         "--history",
@@ -123,18 +131,53 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_history() -> None:
-    records = load_history()
+    records = list(reversed(load_history()))
     if not records:
         print("No run history yet.")
         return
-    for record in records:
+    resumable = resumable_run_ids()
+    for index, record in enumerate(records, start=1):
         when = datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d %H:%M")
-        status = "cancelled" if record.cancelled else "done"
-        print(f"{when}  [{status}]  {', '.join(record.directories)}")
+        if not record.cancelled:
+            status = "done"
+        elif str(record.timestamp) in resumable:
+            status = "cancelled, resumable"
+        else:
+            status = "cancelled"
+        print(f"#{index}  {when}  [{status}]  {', '.join(record.directories)}")
         print(
             f"    {record.groups} duplicate group(s), {human_size(record.reclaimable_bytes)} reclaimable, "
             f"{record.skipped} skipped, {record.duration_seconds:.1f}s"
         )
+
+
+def _resolve_resume_run_id(resume_arg: str) -> tuple[Optional[str], Optional[str]]:
+    """Turn `--resume`'s value into a resume_states.json run_id.
+
+    `resume_arg` is "LAST" for a bare `--resume`, or the #index string from
+    `--history`'s output for `--resume N`. Returns (run_id, error_message)
+    -- exactly one of the two is not None.
+    """
+    if resume_arg == "LAST":
+        run_id = latest_resume_run_id()
+        if run_id is None:
+            return None, "No stopped run to resume."
+        return run_id, None
+
+    try:
+        index = int(resume_arg)
+    except ValueError:
+        return None, f"--resume expects the # index shown by --history, got {resume_arg!r}"
+
+    records = list(reversed(load_history()))
+    if index < 1 or index > len(records):
+        return None, f"No run #{index} in history -- run --history to see valid indexes."
+
+    record = records[index - 1]
+    run_id = str(record.timestamp)
+    if not record.cancelled or run_id not in resumable_run_ids():
+        return None, f"Run #{index} has no saved progress to resume."
+    return run_id, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -171,11 +214,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     resume_state = None
-    if args.resume:
+    resume_run_id = None
+    if args.resume is not None:
         if args.directories:
-            print("Error: --resume picks up the last stopped scan and doesn't take directories")
+            print("Error: --resume picks up a stopped scan and doesn't take directories")
             return 1
-        resume_state = load_resume_state()
+        resume_run_id, error = _resolve_resume_run_id(args.resume)
+        if error is not None:
+            print(error)
+            return 1
+        resume_state = load_resume_state(resume_run_id)
         if resume_state is None:
             print("No stopped run to resume.")
             return 1
@@ -220,11 +268,11 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGINT, previous_handler)
     duration = time.monotonic() - start
 
-    record_run(directories, result, duration)
+    record = record_run(directories, result, duration)
+    if resume_run_id is not None:
+        clear_resume_state(resume_run_id)
     if result.cancelled and result.resume_state is not None:
-        save_resume_state(result.resume_state)
-    else:
-        clear_resume_state()
+        save_resume_state(str(record.timestamp), result.resume_state)
 
     folder_groups = result.folder_groups
     if args.min_size:
