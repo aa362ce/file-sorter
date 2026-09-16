@@ -1,0 +1,89 @@
+name: Build Windows and macOS executables
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows
+          - os: macos-latest
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui]"
+          pip install pyinstaller
+
+      # PyInstaller's --icon needs a .icns on macOS -- generate one from
+      # the source PNG at build time with macOS's own tools rather than
+      # committing a second binary icon file to the repo.
+      - name: Build macOS .icns from icon.png
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z $size $size src/file_sorter/gui/resources/icon.png --out icon.iconset/icon_${size}x${size}.png
+            double=$((size * 2))
+            sips -z $double $double src/file_sorter/gui/resources/icon.png --out icon.iconset/icon_${size}x${size}@2x.png
+          done
+          iconutil -c icns icon.iconset -o icon.icns
+
+      - name: Build CLI executable (Windows)
+        if: matrix.os == 'windows-latest'
+        run: pyinstaller --onefile --name file-sorter scripts/run_cli.py
+
+      - name: Build GUI executable (Windows)
+        if: matrix.os == 'windows-latest'
+        run: pyinstaller --onefile --windowed --name file-sorter-gui --icon src/file_sorter/gui/resources/icon.ico scripts/run_gui.py
+
+      - name: Build CLI executable (macOS)
+        if: matrix.os == 'macos-latest'
+        run: pyinstaller --onefile --name file-sorter scripts/run_cli.py
+
+      - name: Build GUI app bundle (macOS)
+        if: matrix.os == 'macos-latest'
+        run: pyinstaller --onefile --windowed --name file-sorter-gui --icon icon.icns scripts/run_gui.py
+
+      - name: Stage artifacts (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-out
+          Copy-Item dist\file-sorter.exe dist-out\
+          Copy-Item dist\file-sorter-gui.exe dist-out\
+
+      - name: Stage artifacts (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p dist-out
+          cp dist/file-sorter dist-out/file-sorter-macos
+          # GitHub release assets must be plain files, not directories --
+          # zip the .app bundle, and use ditto (not plain zip) so the
+          # bundle's resource forks/metadata survive the round trip.
+          ditto -c -k --sequesterRsrc dist/file-sorter-gui.app dist-out/file-sorter-gui-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: file-sorter-${{ matrix.artifact }}
+          path: dist-out/*
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-out/*
