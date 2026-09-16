@@ -59,6 +59,18 @@ class ResumeState:
     re-discovering (and, worse, re-counting) everything already found --
     see `dedupe._walk_checkpointed`.
 
+    `root_keys` maps each scan root (a `directories` entry, as a string)
+    to its own "dev:ino" identity at checkpoint time -- not the identity
+    of anything under it. A "dev:ino" pair isn't a permanent identifier:
+    unplugging an external drive and later mounting a *different* one at
+    the same path (or drive letter) can reuse it, especially for
+    low-numbered inodes. Comparing this against the root's current
+    identity before trusting anything else in the state is what stops a
+    resumed scan from silently treating a different drive's directories as
+    "already covered" (stage "scanning") or hashing/comparing a different
+    drive's files under paths that happen to still exist (any stage) --
+    see `dedupe._resume_roots_match`.
+
     A scan also checkpoints incrementally as it runs (see
     `dedupe.find_duplicates`'s `on_checkpoint` and `checkpoint_progress`
     below) so a hard crash or power loss finds recent progress, not just
@@ -76,6 +88,7 @@ class ResumeState:
     processed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     completed_dirs: list[str] = field(default_factory=list)
+    root_keys: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,7 +110,8 @@ class CheckpointDelta:
     time. (`by_size` here means the *stage 2/3* one-time snapshot of the
     stage-1 result -- unrelated to "scanning"'s own incremental
     `new_entries`, which feed the same table by a different, appending
-    path; see `checkpoint_progress`.)
+    path; see `checkpoint_progress`.) `root_keys` is also only set on the
+    very first checkpoint of a run -- see `ResumeState.root_keys`.
     """
 
     stage: str
@@ -106,6 +120,7 @@ class CheckpointDelta:
     new_completed_dirs: list[str] = field(default_factory=list)
     by_size: Optional[dict[str, list[str]]] = None
     directories: Optional[list[str]] = None
+    root_keys: Optional[dict[str, str]] = None
 
 
 @dataclass
@@ -258,6 +273,7 @@ def _replace_resume_state(conn: sqlite3.Connection, run_id: str, state: ResumeSt
     rows += [(run_id, "by_full", key, path) for key, paths in state.by_full.items() for path in paths]
     rows += [(run_id, "skipped", "", path) for path in state.skipped]
     rows += [(run_id, "completed_dirs", "", dir_key) for dir_key in state.completed_dirs]
+    rows += [(run_id, "root_keys", directory, key) for directory, key in state.root_keys.items()]
     if rows:
         conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
     _evict_old_resume_runs(conn)
@@ -299,6 +315,13 @@ def checkpoint_progress(run_id: str, delta: CheckpointDelta) -> None:
             # a retry ever sends it twice.
             conn.execute("DELETE FROM resume_progress WHERE run_id = ? AND list_name = 'by_size'", (run_id,))
             rows = [(run_id, "by_size", key, path) for key, paths in delta.by_size.items() for path in paths]
+            if rows:
+                conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
+        if delta.root_keys is not None:
+            # Same one-time replace pattern as by_size above -- root_keys
+            # never changes after the first checkpoint of a run.
+            conn.execute("DELETE FROM resume_progress WHERE run_id = ? AND list_name = 'root_keys'", (run_id,))
+            rows = [(run_id, "root_keys", directory, key) for directory, key in delta.root_keys.items()]
             if rows:
                 conn.executemany("INSERT INTO resume_progress (run_id, list_name, key, path) VALUES (?, ?, ?, ?)", rows)
         if delta.new_entries:
@@ -343,6 +366,7 @@ def load_resume_state(run_id: str) -> Optional[ResumeState]:
     by_full: dict[str, list[str]] = defaultdict(list)
     skipped: list[str] = []
     completed_dirs: list[str] = []
+    root_keys: dict[str, str] = {}
     for list_name, key, path in rows:
         if list_name == "by_size":
             by_size[key].append(path)
@@ -354,6 +378,8 @@ def load_resume_state(run_id: str) -> Optional[ResumeState]:
             skipped.append(path)
         elif list_name == "completed_dirs":
             completed_dirs.append(path)
+        elif list_name == "root_keys":
+            root_keys[key] = path
 
     # `processed` isn't stored directly -- every path that ended up in
     # by_partial/by_full or skipped was, by construction, also counted as
@@ -372,6 +398,7 @@ def load_resume_state(run_id: str) -> Optional[ResumeState]:
         processed=processed,
         skipped=skipped,
         completed_dirs=completed_dirs,
+        root_keys=root_keys,
     )
 
 
