@@ -60,6 +60,23 @@ files that are exact duplicates (by content), along with total
 reclaimable space. Unreadable files (permission-protected, removed
 mid-scan) are skipped and reported rather than aborting the scan.
 
+### Deleting duplicates
+
+By default `file-sorter` only reports what it finds. Add `--delete` to
+also delete afterward -- the first file listed in each group is kept, the
+rest are moved to the Trash (via `send2trash`, never permanently deleted):
+
+```bash
+file-sorter ~/Downloads --delete
+file-sorter ~/Downloads --delete --yes   # skip the "are you sure?" prompt
+```
+
+A large-file group that wasn't fully verified during the scan (see
+`--large-threshold` above) is compared against its kept file right before
+deletion, and skipped -- with a warning, nothing deleted -- if it turns out
+not to actually match, rather than risk deleting a file that only
+coincidentally shared a size and partial hash.
+
 ### Progress and logging
 
 A live progress line (files scanned, then quick-hash and full-hash

@@ -9,7 +9,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .dedupe import LARGE_FILE_THRESHOLD, default_workers, find_duplicates
+from send2trash import send2trash
+
+from .dedupe import LARGE_FILE_THRESHOLD, DuplicateGroup, default_workers, files_equal, find_duplicates
 from .formatting import human_size
 from .history import export_history, import_history, load_history, record_run
 from .resume import clear_resume_state, load_resume_state, save_resume_state
@@ -66,6 +68,24 @@ def build_parser() -> argparse.ArgumentParser:
             f"the scan -- confirmation is deferred until deletion (default: {LARGE_FILE_THRESHOLD}, "
             "i.e. 500MB; pass 0 to always fully confirm during the scan)"
         ),
+    )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help=(
+            "Delete duplicates after scanning -- keeps the first file in each group and "
+            "moves the rest to the Trash (via send2trash, never permanently deleted), same "
+            "convention as the GUI. A large-file group not verified during the scan is "
+            "compared against its kept file right before deletion, and skipped (with a "
+            "warning, nothing deleted) if it doesn't actually match. Prompts for "
+            "confirmation unless -y/--yes is given."
+        ),
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt before deleting (only meaningful with --delete)",
     )
     parser.add_argument(
         "--resume",
@@ -230,7 +250,53 @@ def main(argv: list[str] | None = None) -> int:
     if result.cancelled and result.resume_state is not None:
         print("\nRun 'file-sorter --resume' to continue this scan where it left off.")
 
+    if args.delete and groups:
+        _delete_duplicates(groups, skip_confirmation=args.yes)
+
     return 0
+
+
+def _delete_duplicates(groups: list[DuplicateGroup], *, skip_confirmation: bool) -> None:
+    # Same convention as the GUI: keep the first file in each group, delete the rest.
+    to_delete = [(group, path) for group in groups for path in group.paths[1:]]
+    if not to_delete:
+        return
+
+    if not skip_confirmation:
+        try:
+            answer = input(f"\nMove {len(to_delete)} file(s) to Trash? [y/N] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer not in ("y", "yes"):
+            print("Aborted -- no files deleted.")
+            return
+
+    deleted = 0
+    failures = []
+    for group, path in to_delete:
+        if not group.confirmed:
+            try:
+                verified = files_equal(group.paths[0], path)
+            except OSError as exc:
+                failures.append(f"{path}: could not verify against kept file: {exc}")
+                continue
+            if not verified:
+                failures.append(
+                    f"{path}: not verified as an actual duplicate of the kept file -- "
+                    "skipped rather than risk deleting a non-duplicate"
+                )
+                continue
+        try:
+            send2trash(str(path))
+            deleted += 1
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+
+    print(f"\nDeleted {deleted} file(s) to Trash.")
+    if failures:
+        print(f"{len(failures)} file(s) were not deleted:")
+        for line in failures:
+            print(f"  {line}")
 
 
 if __name__ == "__main__":
