@@ -108,7 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Don't skip the built-in default directories (node_modules, virtualenvs, "
-            "interpreter/tool caches) -- scan everything. Any --exclude names are still applied."
+            "interpreter/tool caches) or files (.DS_Store, Thumbs.db, editor swap/backup "
+            "files, etc.) -- scan everything. Any --exclude names are still applied."
         ),
     )
     parser.add_argument(
@@ -315,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     run_id = resume_run_id if resume_run_id is not None else str(time.time())
 
     exclude_dirs = set(args.exclude) if args.no_default_excludes else DEFAULT_EXCLUDED_DIR_NAMES | set(args.exclude)
+    exclude_temp_files = not args.no_default_excludes
     # args.file_types defaults to [] (argparse append), but find_duplicates
     # treats an empty collection as "match zero categories" (finds
     # nothing) rather than "no filter" -- None is what means "no filter"
@@ -333,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
             large_file_threshold=args.large_threshold,
             on_checkpoint=lambda delta: checkpoint_progress(run_id, delta),
             exclude_dirs=exclude_dirs,
+            exclude_temp_files=exclude_temp_files,
             file_types=file_types,
         )
     finally:

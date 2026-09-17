@@ -62,6 +62,38 @@ DEFAULT_EXCLUDED_DIR_NAMES = frozenset(
     }
 )
 
+# Individual FILES excluded by default, alongside DEFAULT_EXCLUDED_DIR_NAMES
+# above -- OS/app marker and temp files that are either deliberately
+# identical everywhere they appear (so "duplicate" is meaningless -- macOS
+# drops an empty .localized into every folder set to use localized names,
+# so a whole-drive scan would otherwise report it as one giant duplicate
+# group spanning most of the filesystem and saying nothing real about
+# wasted space) or are disposable scratch files nobody would want to
+# review or delete copies out of by hand.
+#
+# Exact names are matched case-insensitively against the whole filename.
+# Extensions and the trailing "~" convention (emacs/many editors' backup
+# files) are matched case-insensitively against the end of the filename.
+DEFAULT_EXCLUDED_FILE_NAMES = frozenset(
+    {
+        ".ds_store",  # macOS Finder metadata
+        ".localized",  # macOS folder-localization marker -- always empty
+        "thumbs.db",  # Windows thumbnail cache
+        "desktop.ini",  # Windows folder config
+        ".gitkeep",  # Git placeholder -- conventionally empty
+    }
+)
+DEFAULT_EXCLUDED_FILE_EXTENSIONS = frozenset({".tmp", ".temp", ".swp", ".swo", ".bak"})
+
+
+def _is_default_excluded_file(name: str) -> bool:
+    lowered = name.lower()
+    if lowered in DEFAULT_EXCLUDED_FILE_NAMES:
+        return True
+    if lowered.endswith("~"):
+        return True
+    return Path(lowered).suffix in DEFAULT_EXCLUDED_FILE_EXTENSIONS
+
 # Extensions (lowercase, with the leading dot) making up each named file
 # type category -- see `find_duplicates`'s `file_types`. Not exhaustive,
 # just the common cases for each category; a file whose extension isn't
@@ -169,6 +201,7 @@ def _walk_checkpointed(
     already_seen: set[Path],
     excluded_names: frozenset[str] = frozenset(),
     extension_filter: Optional[Callable[[str], bool]] = None,
+    exclude_temp_files: bool = False,
 ) -> Iterator[tuple[str, object]]:
     """Recursively yield every file under `directories`, resumable at
     directory granularity -- used for stage 1's own checkpointing (see
@@ -197,6 +230,11 @@ def _walk_checkpointed(
     descended into), it only filters which files are reported. None means
     no filtering: every file found is yielded, the existing default
     behavior.
+
+    `exclude_temp_files`, if True, skips files matching
+    `_is_default_excluded_file` (OS/app marker and temp files -- see
+    `DEFAULT_EXCLUDED_FILE_NAMES`) the same way `extension_filter` skips
+    files, just with its own fixed rule rather than a caller-supplied one.
 
     Explicit-stack DFS rather than recursion, so a directory's completion
     can be observed as an event (yielded once every entry in it -- files
@@ -265,6 +303,8 @@ def _walk_checkpointed(
                 try_push(Path(entry.path), os.stat(entry.path))
             elif not is_symlink and entry.is_file(follow_symlinks=False):
                 path = Path(entry.path)
+                if exclude_temp_files and _is_default_excluded_file(entry.name):
+                    continue
                 if extension_filter is not None and not extension_filter(path.suffix.lower()):
                     continue
                 if path not in already_seen:
@@ -675,6 +715,7 @@ def find_duplicates(
     on_checkpoint: Optional[CheckpointCallback] = None,
     on_group_found: Optional[GroupFoundCallback] = None,
     exclude_dirs: Optional[Iterable[str]] = None,
+    exclude_temp_files: bool = True,
     file_types: Optional[Iterable[str]] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
@@ -730,6 +771,15 @@ def find_duplicates(
     Matched case-insensitively against a directory's own name, not its
     full path, so it applies at any depth; never applied to a root in
     `directories` itself, only to directories encountered during the walk.
+
+    `exclude_temp_files` (default True) skips individual files matching
+    `DEFAULT_EXCLUDED_FILE_NAMES`/`DEFAULT_EXCLUDED_FILE_EXTENSIONS` (OS/app
+    marker and temp files, e.g. `.DS_Store`, `Thumbs.db`, editor swap/backup
+    files) -- the file-level counterpart to `exclude_dirs`, on by default
+    for the same reason: these are either meaningless as "duplicates"
+    (macOS's `.localized` is deliberately identical and empty in every
+    folder that has one) or disposable scratch files nobody wants to
+    review. Pass False to disable and scan every file.
 
     `file_types`, if given, restricts the scan to files matching one or
     more categories in `VALID_FILE_TYPES` (e.g. `{"images", "video"}`) --
@@ -965,6 +1015,7 @@ def find_duplicates(
             already_seen=already_seen,
             excluded_names=excluded_names,
             extension_filter=extension_filter,
+            exclude_temp_files=exclude_temp_files,
         ):
             if is_cancelled():
                 cancelled = True

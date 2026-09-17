@@ -30,6 +30,8 @@ from send2trash import send2trash
 
 from ..dedupe import (
     DEFAULT_EXCLUDED_DIR_NAMES,
+    DEFAULT_EXCLUDED_FILE_EXTENSIONS,
+    DEFAULT_EXCLUDED_FILE_NAMES,
     VALID_FILE_TYPES,
     DuplicateGroup,
     ScanResult,
@@ -51,6 +53,12 @@ from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
 ICON_PATH = Path(__file__).resolve().parent / "resources" / "icon.png"
+
+# A scan can easily produce thousands of groups -- neither reviewable by a
+# person nor free to render (see _render_results) -- so only the most
+# impactful ones (by how much space deleting all but one copy would
+# actually reclaim) are ever shown.
+TOP_RESULTS_LIMIT = 10
 
 
 class MainWindow(QMainWindow):
@@ -110,11 +118,14 @@ class MainWindow(QMainWindow):
         dir_row.addLayout(dir_buttons)
         layout.addLayout(dir_row)
 
-        self.exclude_common_checkbox = QCheckBox("Skip node_modules, virtualenvs && caches")
+        self.exclude_common_checkbox = QCheckBox("Skip node_modules, virtualenvs, caches && temp files")
         self.exclude_common_checkbox.setChecked(True)
         self.exclude_common_checkbox.setToolTip(
             "Skips these directories entirely wherever found, not just at the top level:\n"
             + ", ".join(sorted(DEFAULT_EXCLUDED_DIR_NAMES))
+            + "\n\nAnd these files (by name or extension), e.g. .DS_Store, Thumbs.db, "
+            "editor swap/backup files -- OS/app markers, never meaningful as \"duplicates\":\n"
+            + ", ".join(sorted(DEFAULT_EXCLUDED_FILE_NAMES | DEFAULT_EXCLUDED_FILE_EXTENSIONS))
         )
         layout.addWidget(self.exclude_common_checkbox)
 
@@ -230,12 +241,14 @@ class MainWindow(QMainWindow):
         # None -> find_duplicates' own default (DEFAULT_EXCLUDED_DIR_NAMES);
         # [] -> exclusion disabled, scan everything.
         exclude_dirs = None if self.exclude_common_checkbox.isChecked() else []
+        exclude_temp_files = self.exclude_common_checkbox.isChecked()
         scan_types = {name for name, cb in self._scan_type_checkboxes.items() if cb.isChecked()} or None
         self._worker = ScanWorker(
             directories,
             resume_state=resume_state,
             run_id=self._run_id,
             exclude_dirs=exclude_dirs,
+            exclude_temp_files=exclude_temp_files,
             file_types=scan_types,
         )
         self._worker.progress.connect(self._on_progress)
@@ -351,10 +364,16 @@ class MainWindow(QMainWindow):
         filter never requires re-scanning. `None` selected (the default,
         every checkbox unchecked) means no filter: every group shown.
 
-        Folder-duplicate rows are never filtered by type -- a directory
-        doesn't have a single type the way a file does, so "type" isn't a
-        meaningful question to ask of one; a folder match is either
-        relevant or it isn't, independent of what's inside it.
+        Folder and file-level groups are ranked together by how much space
+        deleting all but one copy would actually reclaim (size * (copies
+        - 1) for each), and only the top `TOP_RESULTS_LIMIT` are ever
+        rendered -- a scan easily produces thousands of groups, which is
+        neither reviewable by a person nor free to render, and the
+        biggest wins are what someone freeing up space actually wants
+        first. Folder-duplicate rows are still never *filtered* by type --
+        a directory doesn't have a single type the way a file does -- but
+        they do compete for a top-10 slot on equal footing with file
+        groups, since both represent real reclaimable space.
         """
         result = self._last_result
         if result is None:
@@ -376,26 +395,35 @@ class MainWindow(QMainWindow):
         # about which copy is "kept" for the very same file.
         confirmed_folder_dirs = [d for fg in result.folder_groups if fg.confirmed for d in fg.paths]
 
+        ranked: list[tuple[int, object]] = [
+            (fg.size * (len(fg.paths) - 1), fg) for fg in result.folder_groups
+        ] + [(g.size * (len(g.paths) - 1), g) for g in groups_to_show]
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        top = ranked[:TOP_RESULTS_LIMIT]
+        total_reclaimable = sum(reclaimable for reclaimable, _item in ranked)
+
         # Building potentially tens of thousands of tree items one at a
         # time -- each triggering its own model-update and, for every
         # checkbox set, an itemChanged signal (see _on_item_changed) -- is
         # what froze the UI thread for a very long time on a whole-drive
         # scan. Block both, build every item off-tree first, and attach
-        # everything in a single bulk call instead.
+        # everything in a single bulk call instead. Less of a concern now
+        # that at most TOP_RESULTS_LIMIT items are ever built, but the
+        # pattern costs nothing to keep.
         self.results_tree.blockSignals(True)
         self.results_tree.setUpdatesEnabled(False)
         try:
             # Discard whatever's there -- either _on_groups_found's live
             # preview rows (see there) the first time this runs after a
             # scan, or this method's own previous filtered render the next
-            # time the filter selection changes. Rebuilding from scratch
-            # rather than reconciling in place is what guarantees no
-            # duplicate/stale rows, at the cost of a brief rebuild here --
-            # already the bulk/blocked pattern below, so cheap even for a
-            # large result.
+            # time the filter selection changes.
             self.results_tree.clear()
-            headers = [self._build_folder_group_item(fg) for fg in result.folder_groups]
-            headers += [self._build_group_item(g, confirmed_folder_dirs) for g in groups_to_show]
+            headers = [
+                self._build_folder_group_item(item)
+                if isinstance(item, FolderGroup)
+                else self._build_group_item(item, confirmed_folder_dirs)
+                for _reclaimable, item in top
+            ]
             self.results_tree.addTopLevelItems(headers)
             for header in headers:
                 header.setExpanded(True)
@@ -403,11 +431,14 @@ class MainWindow(QMainWindow):
             self.results_tree.setUpdatesEnabled(True)
             self.results_tree.blockSignals(False)
 
-        folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
-        filter_note = f" ({len(groups_to_show)}/{len(result.groups)} shown)" if selected_types else ""
+        filter_note = f" ({len(groups_to_show)}/{len(result.groups)} match filter)" if selected_types else ""
+        top_note = (
+            f" -- showing top {len(top)} by reclaimable space" if len(ranked) > len(top) else ""
+        )
         self.status_label.setText(
-            f"{len(result.groups)} duplicate group(s) found{filter_note}{folder_note}{skipped_note}"
+            f"{len(result.groups)} duplicate group(s), {len(result.folder_groups)} duplicate folder(s), "
+            f"{human_size(total_reclaimable)} reclaimable{filter_note}{top_note}{skipped_note}"
             f"{self._last_result_cancelled_note}"
         )
         self._update_reclaimable_label()

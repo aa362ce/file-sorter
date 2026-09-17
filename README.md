@@ -76,7 +76,7 @@ files that are exact duplicates (by content), along with total
 reclaimable space. Unreadable files (permission-protected, removed
 mid-scan) are skipped and reported rather than aborting the scan.
 
-### Excluding directories
+### Excluding directories and temp files
 
 `node_modules`, virtualenvs (`venv`, `.venv`, `env`, `.env`, `virtualenv`),
 and common interpreter/tool caches (`__pycache__`, `.pytest_cache`,
@@ -86,9 +86,18 @@ always regenerable and near-guaranteed to bury real results under
 enormous numbers of expected, uninteresting duplicates. A directory you
 pass directly as a scan target is always scanned regardless of its name.
 
+Individual OS/app marker and temp files are skipped the same way:
+`.DS_Store`, `.localized`, `Thumbs.db`, `desktop.ini`, `.gitkeep`, editor
+swap/backup files (`.tmp`, `.temp`, `.swp`, `.swo`, `.bak`, trailing `~`).
+Some of these are deliberately identical everywhere they appear -- macOS
+drops an empty `.localized` into every folder set to use localized
+names, so without this a whole-drive scan would report it (and, worse,
+every folder containing only it) as duplicates spanning most of the
+filesystem, saying nothing real about wasted space.
+
 ```bash
-file-sorter ~/projects --exclude dist --exclude .next   # add more, on top of the defaults
-file-sorter ~/projects --no-default-excludes             # scan everything, defaults off
+file-sorter ~/projects --exclude dist --exclude .next   # add more dirs, on top of the defaults
+file-sorter ~/projects --no-default-excludes             # scan everything -- dirs and files, defaults off
 ```
 
 ### Scanning specific file types
@@ -203,11 +212,12 @@ pip install -e ".[gui]"
 file-sorter-gui
 ```
 
-Add one or more directories. "Skip node_modules, virtualenvs & caches"
-(checked by default) and "Only scan:" (a set of type checkboxes, none
-checked by default -- meaning every file) both narrow what a scan even
-looks at, the same as the CLI's `--exclude`/`--no-default-excludes` and
-`--type`. Then click "Scan for Duplicates" (runs off the UI thread, so
+Add one or more directories. "Skip node_modules, virtualenvs, caches &
+temp files" (checked by default) and "Only scan:" (a set of type
+checkboxes, none checked by default -- meaning every file) both narrow
+what a scan even looks at, the same as the CLI's
+`--exclude`/`--no-default-excludes` and `--type`. Then click "Scan for
+Duplicates" (runs off the UI thread, so
 the window stays responsive; "Cancel" stops it early -- "Resume Last
 Run" becomes enabled afterward to pick that scan back up). Duplicate
 groups appear in the results tree as they're confirmed, not just once the
@@ -237,13 +247,22 @@ folder" and "delete this one file inside it." An *unverified* (large-file)
 folder's row is informational only, and its files remain regular,
 individually checkable duplicate groups instead.
 
+A scan can easily turn up thousands of groups -- more than anyone would
+review by hand, and not free to render either -- so folder and file-level
+groups are ranked together by how much space deleting all but one copy
+would actually reclaim, and only the top 10 are ever shown (the status
+line always states the true total group/folder count and total
+reclaimable space regardless, so nothing's hidden from view, just not
+rendered as individual rows past the top 10).
+
 Once a scan finishes, "Filter results:" (another row of type checkboxes,
 disabled until there's a finished result to filter) narrows which of
-*that* scan's groups are shown -- unlike "Only scan:" above, this never
-re-scans: it's a pure re-render of the same result, so you can freely
-switch it back and forth to browse a completed scan by type. Folder rows
-are never affected by it, since a directory doesn't have a single type
-the way a file does.
+*that* scan's groups are eligible for that top-10 ranking -- unlike "Only
+scan:" above, this never re-scans: it's a pure re-render of the same
+result, so you can freely switch it back and forth to browse a completed
+scan by type. Folder rows are never *filtered* by it, since a directory
+doesn't have a single type the way a file does, but they still compete
+for a top-10 slot on equal footing with file groups.
 
 "History" shows past
 runs from both the GUI and the CLI; a cancelled run with saved progress
