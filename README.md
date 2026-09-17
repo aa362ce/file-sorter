@@ -174,8 +174,17 @@ file-sorter-gui
 
 Add one or more directories, click "Scan for Duplicates" (runs off the UI
 thread, so the window stays responsive; "Cancel" stops it early -- "Resume
-Last Run" becomes enabled afterward to pick that scan back up), then
-check the copies you want gone and "Delete Checked" -- files are moved to
+Last Run" becomes enabled afterward to pick that scan back up). Duplicate
+groups appear in the results tree as they're confirmed, not just once the
+whole scan (including the folder-duplicate analysis that runs after --
+see above) finishes -- so there's something to look at during a long scan
+instead of a blank tree the entire time. That's a live preview only:
+folder-covered files can't be correctly distinguished until folder
+analysis completes, so once the scan finishes the tree is cleared and
+rebuilt from the authoritative final result, which is when a duplicate
+folder row appears and its files switch from individually-checkable to
+informational. Then check the copies you want gone and "Delete Checked" --
+files are moved to
 the Trash (via `send2trash`), never permanently deleted. Each duplicate
 group defaults to keeping the first copy and checking the rest, and the
 app refuses to let every copy in a group be checked at once, so you can't

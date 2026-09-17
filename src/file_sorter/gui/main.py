@@ -173,6 +173,7 @@ class MainWindow(QMainWindow):
 
         self._worker = ScanWorker(directories, resume_state=resume_state, run_id=self._run_id)
         self._worker.progress.connect(self._on_progress)
+        self._worker.group_found.connect(self._on_groups_found)
         self._worker.finished_scan.connect(self._on_scan_finished)
         self._worker.start()
 
@@ -209,6 +210,31 @@ class MainWindow(QMainWindow):
         else:
             self.progress_bar.setRange(0, 0)
             self.status_label.setText(f"{stage}: {count}")
+
+    def _on_groups_found(self, groups: list[DuplicateGroup]) -> None:
+        """Live preview only -- appends newly-confirmed groups to the tree
+        as the scan runs, so there's something to look at during a long
+        scan instead of a blank tree until the very end. Not the
+        authoritative final layout: whether a file is covered by a
+        confirmed duplicate folder isn't known until folder analysis runs
+        (after stage 3, see `find_duplicates`), so these rows are always
+        rendered as plain checkable groups, never folder-covered/informational.
+        `_on_scan_finished` clears the tree and rebuilds it from the
+        authoritative result, which is when that distinction is applied --
+        so these live rows are guaranteed to be superseded, not merged
+        with, the final ones.
+        """
+        self.results_tree.blockSignals(True)
+        self.results_tree.setUpdatesEnabled(False)
+        try:
+            headers = [self._build_group_item(g) for g in groups]
+            self.results_tree.addTopLevelItems(headers)
+            for header in headers:
+                header.setExpanded(True)
+        finally:
+            self.results_tree.setUpdatesEnabled(True)
+            self.results_tree.blockSignals(False)
+        self._update_reclaimable_label()
 
     def _on_scan_finished(self, result: ScanResult) -> None:
         self.scan_btn.setEnabled(True)
@@ -259,6 +285,15 @@ class MainWindow(QMainWindow):
         self.results_tree.blockSignals(True)
         self.results_tree.setUpdatesEnabled(False)
         try:
+            # Discard whatever _on_groups_found streamed in live during the
+            # scan -- those rows are always plain, un-folder-covered groups
+            # (see there), which this authoritative rebuild can now render
+            # correctly since folder analysis has finished. Rebuilding from
+            # scratch rather than reconciling in place is what guarantees
+            # no duplicate/stale rows, at the cost of a brief rebuild here
+            # -- already the bulk/blocked pattern below, so cheap even for
+            # a large result.
+            self.results_tree.clear()
             headers = [self._build_folder_group_item(fg) for fg in result.folder_groups]
             headers += [self._build_group_item(g, confirmed_folder_dirs) for g in result.groups]
             self.results_tree.addTopLevelItems(headers)

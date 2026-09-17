@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 
 ProgressCallback = Callable[[str, int, Optional[int]], None]
 CheckpointCallback = Callable[[CheckpointDelta], None]
+GroupFoundCallback = Callable[[list["DuplicateGroup"]], None]
 
 PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
@@ -30,6 +32,14 @@ LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
 # write itself (a single-row SQLite UPSERT, see `store.save_resume_state`)
 # never becomes the bottleneck.
 CHECKPOINT_INTERVAL = 2000
+
+# Same throttle interval as Progress's own terminal/on_progress cadence
+# (see progress.py) -- on_group_found batches newly-confirmed groups and
+# flushes at most this often, for the same reason on_progress is throttled
+# there: emitting one signal per confirmed group could mean hundreds of
+# thousands of individual cross-thread Qt signal emissions on a large
+# scan, exactly what previously flooded the GUI's event queue.
+GROUP_EMIT_INTERVAL = 0.2
 
 T = TypeVar("T")
 K = TypeVar("K")
@@ -190,6 +200,7 @@ def _group_by_content(
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
     on_checkpoint: Optional[Callable[[list[tuple[str, Path]], list[Path]], None]] = None,
+    on_group_found: Optional[GroupFoundCallback] = None,
 ) -> tuple[dict[str, list[Path]], list[Path], list[Path], bool]:
     """Confirm which files within each bucket (files that already share a
     size and a partial hash from earlier stages) are true duplicates, by
@@ -213,6 +224,13 @@ def _group_by_content(
     how far into a huge scan it fires, instead of proportional to total
     progress so far (which would make checkpointing itself the bottleneck
     on a scan with millions of files).
+
+    `on_group_found(groups)`, if given, is called with newly-confirmed
+    groups as soon as each bucket resolves them, batched and throttled to
+    `GROUP_EMIT_INTERVAL` the same way `on_progress` is -- so a caller (the
+    GUI) can populate results incrementally as the scan runs instead of
+    waiting for the entire scan (including whatever comes after this stage,
+    e.g. folder analysis) to finish before showing anything.
     """
     result: dict[str, list[Path]] = {}
     processed: list[Path] = []
@@ -220,6 +238,25 @@ def _group_by_content(
     cancelled = False
     total = sum(len(bucket) for bucket in buckets)
     progress = Progress(stage_label, total=total, enabled=show_progress, on_progress=on_progress)
+
+    found_batch: list[DuplicateGroup] = []
+    last_group_emit = 0.0
+
+    def queue_group(group: DuplicateGroup) -> None:
+        nonlocal last_group_emit
+        if on_group_found is None:
+            return
+        found_batch.append(group)
+        now = time.monotonic()
+        if now - last_group_emit >= GROUP_EMIT_INTERVAL:
+            on_group_found(list(found_batch))
+            found_batch.clear()
+            last_group_emit = now
+
+    def flush_groups_final() -> None:
+        if on_group_found is not None and found_batch:
+            on_group_found(list(found_batch))
+            found_batch.clear()
 
     # Append-only logs mirroring `result`/`skipped`, used only to compute
     # cheap since-last-checkpoint deltas below -- see `on_checkpoint` above.
@@ -262,6 +299,17 @@ def _group_by_content(
             # to support the delta slicing in flush_checkpoint below -- not
             # worth the extra memory when there's no checkpoint consumer.
             checkpoint_log.extend((digest, p) for p in group_paths)
+        if on_group_found is not None:
+            # Only paid for a caller that actually wants live updates --
+            # every path here already passed through stage 1's stat(), but
+            # that size wasn't threaded this far down, so it's cheap to
+            # redo once per confirmed group rather than restructure
+            # `buckets` to carry it just for this.
+            try:
+                size = representative.stat().st_size
+            except OSError:
+                size = 0
+            queue_group(DuplicateGroup(file_hash=digest, size=size, paths=group_paths, confirmed=True))
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
     try:
@@ -324,8 +372,10 @@ def _group_by_content(
     # since the last periodic checkpoint (including all of it, if this
     # stage had fewer than CHECKPOINT_INTERVAL files total) would never
     # reach `on_checkpoint`, leaving a resumed stage 3 with an incomplete
-    # `by_full` even though this stage otherwise finished cleanly.
+    # `by_full` even though this stage otherwise finished cleanly. Same
+    # reasoning for the last throttled-but-not-yet-flushed group batch.
     flush_checkpoint(force=True)
+    flush_groups_final()
     progress.close()
     return result, processed, skipped, cancelled
 
@@ -497,6 +547,7 @@ def find_duplicates(
     workers: Optional[int] = None,
     large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
     on_checkpoint: Optional[CheckpointCallback] = None,
+    on_group_found: Optional[GroupFoundCallback] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -529,6 +580,21 @@ def find_duplicates(
     main thread can drain it, making the window appear frozen even though
     the scan itself is proceeding normally. `total` is None for stage 1
     (unknown until the walk finishes).
+
+    `on_group_found(groups)`, if given, is called with newly-confirmed
+    duplicate groups as they're found during stage 3 -- batched and
+    throttled the same way as `on_progress` (see `_group_by_content`) --
+    plus once upfront with every deferred large-file group (those are all
+    already known as soon as stage 2 finishes, no throttling needed for a
+    single batch). This lets a caller (the GUI) populate results
+    incrementally while the scan is still running, rather than waiting for
+    the entire scan -- including whatever runs after stage 3, like folder
+    analysis -- to finish before showing anything. These are a preview
+    only: `ScanResult.groups` returned at the end is always the
+    authoritative final set, since only then is it known whether a file
+    belongs to a confirmed duplicate folder (which changes how it should
+    be rendered) -- a caller should throw away and rebuild from the final
+    result rather than trust the incremental groups' rendering as final.
 
     `cancel_event`, if given, is checked between files; when set, the
     current stage stops early. A group only counts as a confirmed
@@ -866,6 +932,12 @@ def find_duplicates(
             else:
                 buckets.append(paths)
 
+        if deferred_groups and on_group_found is not None:
+            # All already known at this point -- no throttling needed for
+            # a single upfront batch, unlike the incremental stage-3
+            # groups below.
+            on_group_found(list(deferred_groups))
+
         full_total = sum(len(b) for b in buckets)
         if resume_stage == "full_hash":
             logger.info("Resuming stage 3/3: %d candidate file(s) remaining", full_total)
@@ -902,6 +974,7 @@ def find_duplicates(
             on_progress=on_progress,
             is_cancelled=is_cancelled,
             on_checkpoint=_checkpoint_stage3,
+            on_group_found=on_group_found,
         )
         for key, paths in hashed.items():
             by_full[key].extend(paths)

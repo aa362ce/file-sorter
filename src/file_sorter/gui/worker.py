@@ -14,6 +14,7 @@ class ScanWorker(QThread):
     """Runs find_duplicates off the UI thread so the window stays responsive."""
 
     progress = Signal(str, int, object)
+    group_found = Signal(object)
     finished_scan = Signal(object)
 
     def __init__(
@@ -47,5 +48,6 @@ class ScanWorker(QThread):
             cancel_event=self._cancel_event,
             resume_state=self._resume_state,
             on_checkpoint=self._checkpoint if self._run_id is not None else None,
+            on_group_found=lambda groups: self.group_found.emit(groups),
         )
         self.finished_scan.emit(result)
