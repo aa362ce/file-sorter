@@ -76,6 +76,37 @@ files that are exact duplicates (by content), along with total
 reclaimable space. Unreadable files (permission-protected, removed
 mid-scan) are skipped and reported rather than aborting the scan.
 
+### Excluding directories
+
+`node_modules`, virtualenvs (`venv`, `.venv`, `env`, `.env`, `virtualenv`),
+and common interpreter/tool caches (`__pycache__`, `.pytest_cache`,
+`.mypy_cache`, `.ruff_cache`, `.tox`, `.cache`) are skipped by default,
+wherever they're encountered (not just at the top level) -- these are
+always regenerable and near-guaranteed to bury real results under
+enormous numbers of expected, uninteresting duplicates. A directory you
+pass directly as a scan target is always scanned regardless of its name.
+
+```bash
+file-sorter ~/projects --exclude dist --exclude .next   # add more, on top of the defaults
+file-sorter ~/projects --no-default-excludes             # scan everything, defaults off
+```
+
+### Scanning specific file types
+
+Restrict a scan to one or more categories by extension --
+`images`, `audio`, `video`, `documents`, `archives`, `programs`, or
+`misc` (anything not in one of the other categories, including files
+with no extension at all):
+
+```bash
+file-sorter ~/Downloads --type images
+file-sorter ~/Downloads --type images --type video   # combine categories
+```
+
+Omit `--type` entirely to scan every file (the default). Matches by
+extension; a macOS `.app` is a directory, not a file, so `programs` can't
+currently catch duplicate `.app` bundles.
+
 ### Deleting duplicates
 
 By default `file-sorter` only reports what it finds. Add `--delete` to
@@ -172,9 +203,13 @@ pip install -e ".[gui]"
 file-sorter-gui
 ```
 
-Add one or more directories, click "Scan for Duplicates" (runs off the UI
-thread, so the window stays responsive; "Cancel" stops it early -- "Resume
-Last Run" becomes enabled afterward to pick that scan back up). Duplicate
+Add one or more directories. "Skip node_modules, virtualenvs & caches"
+(checked by default) and "Only scan:" (a set of type checkboxes, none
+checked by default -- meaning every file) both narrow what a scan even
+looks at, the same as the CLI's `--exclude`/`--no-default-excludes` and
+`--type`. Then click "Scan for Duplicates" (runs off the UI thread, so
+the window stays responsive; "Cancel" stops it early -- "Resume Last
+Run" becomes enabled afterward to pick that scan back up). Duplicate
 groups appear in the results tree as they're confirmed, not just once the
 whole scan (including the folder-duplicate analysis that runs after --
 see above) finishes -- so there's something to look at during a long scan
@@ -200,7 +235,17 @@ action -- its files are shown underneath for visibility but aren't
 separately checkable, so there's never a conflict between "keep this
 folder" and "delete this one file inside it." An *unverified* (large-file)
 folder's row is informational only, and its files remain regular,
-individually checkable duplicate groups instead. "History" shows past
+individually checkable duplicate groups instead.
+
+Once a scan finishes, "Filter results:" (another row of type checkboxes,
+disabled until there's a finished result to filter) narrows which of
+*that* scan's groups are shown -- unlike "Only scan:" above, this never
+re-scans: it's a pure re-render of the same result, so you can freely
+switch it back and forth to browse a completed scan by type. Folder rows
+are never affected by it, since a directory doesn't have a single type
+the way a file does.
+
+"History" shows past
 runs from both the GUI and the CLI; a cancelled run with saved progress
 is labeled "Cancelled (resumable)" and selecting it enables "Resume
 Selected", which repopulates the directory list and continues that scan

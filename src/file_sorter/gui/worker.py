@@ -24,11 +24,15 @@ class ScanWorker(QThread):
         *,
         resume_state: Optional[ResumeState] = None,
         run_id: Optional[str] = None,
+        exclude_dirs: Optional[Iterable[str]] = None,
+        file_types: Optional[Iterable[str]] = None,
     ) -> None:
         super().__init__(parent)
         self._directories = list(directories)
         self._resume_state = resume_state
         self._run_id = run_id
+        self._exclude_dirs = exclude_dirs
+        self._file_types = file_types
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -49,5 +53,7 @@ class ScanWorker(QThread):
             resume_state=self._resume_state,
             on_checkpoint=self._checkpoint if self._run_id is not None else None,
             on_group_found=lambda groups: self.group_found.emit(groups),
+            exclude_dirs=self._exclude_dirs,
+            file_types=self._file_types,
         )
         self.finished_scan.emit(result)

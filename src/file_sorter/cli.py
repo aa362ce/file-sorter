@@ -12,7 +12,15 @@ from typing import Optional
 
 from send2trash import send2trash
 
-from .dedupe import LARGE_FILE_THRESHOLD, DuplicateGroup, default_workers, files_equal, find_duplicates
+from .dedupe import (
+    DEFAULT_EXCLUDED_DIR_NAMES,
+    LARGE_FILE_THRESHOLD,
+    VALID_FILE_TYPES,
+    DuplicateGroup,
+    default_workers,
+    files_equal,
+    find_duplicates,
+)
 from .folders import FolderGroup
 from .formatting import human_size
 from .store import (
@@ -79,6 +87,42 @@ def build_parser() -> argparse.ArgumentParser:
             "(matched by size + partial hash) without being fully compared during "
             f"the scan -- confirmation is deferred until deletion (default: {LARGE_FILE_THRESHOLD}, "
             "i.e. 500MB; pass 0 to always fully confirm during the scan)"
+        ),
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="NAME",
+        dest="exclude",
+        help=(
+            "Directory name to skip entirely wherever it's encountered (not just at the top "
+            "level) -- repeatable. Added on top of the built-in defaults "
+            f"({', '.join(sorted(DEFAULT_EXCLUDED_DIR_NAMES))}) unless --no-default-excludes is "
+            "also given. Matched case-insensitively; a directory you pass directly as a scan "
+            "target is always scanned regardless of its name."
+        ),
+    )
+    parser.add_argument(
+        "--no-default-excludes",
+        action="store_true",
+        help=(
+            "Don't skip the built-in default directories (node_modules, virtualenvs, "
+            "interpreter/tool caches) -- scan everything. Any --exclude names are still applied."
+        ),
+    )
+    parser.add_argument(
+        "--type",
+        action="append",
+        default=[],
+        dest="file_types",
+        choices=sorted(VALID_FILE_TYPES),
+        metavar="CATEGORY",
+        help=(
+            "Only scan files of this type -- repeatable to combine categories. One of: "
+            f"{', '.join(sorted(VALID_FILE_TYPES))}. Omit entirely to scan every file "
+            "(the default). Matches by extension; a macOS .app is a directory, not a file, "
+            "so 'programs' can't currently catch duplicate .app bundles."
         ),
     )
     parser.add_argument(
@@ -270,6 +314,13 @@ def main(argv: list[str] | None = None) -> int:
     # most a checkpoint interval's worth of work on a large scan.
     run_id = resume_run_id if resume_run_id is not None else str(time.time())
 
+    exclude_dirs = set(args.exclude) if args.no_default_excludes else DEFAULT_EXCLUDED_DIR_NAMES | set(args.exclude)
+    # args.file_types defaults to [] (argparse append), but find_duplicates
+    # treats an empty collection as "match zero categories" (finds
+    # nothing) rather than "no filter" -- None is what means "no filter"
+    # there, so an empty list here must become None, not pass through.
+    file_types = set(args.file_types) if args.file_types else None
+
     previous_handler = signal.signal(signal.SIGINT, handle_sigint)
     start = time.monotonic()
     try:
@@ -281,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.threads,
             large_file_threshold=args.large_threshold,
             on_checkpoint=lambda delta: checkpoint_progress(run_id, delta),
+            exclude_dirs=exclude_dirs,
+            file_types=file_types,
         )
     finally:
         signal.signal(signal.SIGINT, previous_handler)

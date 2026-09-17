@@ -25,6 +25,110 @@ PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
 LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
 
+# Directories excluded from the walk by default -- matched case-insensitively
+# against a directory's own name (basename), not its full path, so this
+# applies no matter how deep it's nested (e.g. every project's own
+# node_modules under a general "projects" folder, not just a top-level one).
+# Two kinds of directory here, both never worth walking into:
+# - Package-manager/interpreter-managed dependency trees (node_modules,
+#   venv/.venv/...): always regenerable from a lockfile/requirements list,
+#   near-guaranteed to contain enormous numbers of duplicate files across
+#   sibling projects (the same package version reinstalled everywhere).
+# - Tool-generated caches (__pycache__, .pytest_cache, ...): disposable,
+#   silently regenerated on the next run, never something a user
+#   authored or would miss.
+# Neither is ever something a user actually wants to review file-by-file
+# or delete copies out of by hand. A scan root explicitly named one of
+# these is still scanned -- exclusion only applies to directories
+# *encountered during* the walk, never to a directory the user directly
+# chose to scan.
+DEFAULT_EXCLUDED_DIR_NAMES = frozenset(
+    {
+        # Dependency trees
+        "node_modules",
+        "venv",
+        ".venv",
+        "env",
+        ".env",
+        "virtualenv",
+        ".virtualenv",
+        # Interpreter/tool caches
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".cache",
+    }
+)
+
+# Extensions (lowercase, with the leading dot) making up each named file
+# type category -- see `find_duplicates`'s `file_types`. Not exhaustive,
+# just the common cases for each category; a file whose extension isn't
+# listed anywhere here is simply never matched by any category (it's
+# still scanned normally when no `file_types` filter is given at all).
+#
+# Limitation: this matches individual *files* only. A macOS ".app" is a
+# directory (a bundle), never seen as a file by the walk at all, so
+# "programs" can't currently catch duplicate .app bundles -- only
+# single-file executables/installers.
+FILE_TYPE_CATEGORIES: dict[str, frozenset[str]] = {
+    "images": frozenset(
+        {
+            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+            ".heic", ".heif", ".svg", ".ico", ".raw", ".cr2", ".nef", ".arw", ".dng",
+        }
+    ),
+    "audio": frozenset(
+        {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".aiff", ".alac", ".opus"}
+    ),
+    "video": frozenset(
+        {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp"}
+    ),
+    "documents": frozenset(
+        {
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf",
+            ".odt", ".ods", ".odp", ".md", ".csv", ".pages", ".key", ".numbers",
+        }
+    ),
+    "archives": frozenset({".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2"}),
+    "programs": frozenset(
+        {".exe", ".msi", ".dmg", ".pkg", ".apk", ".deb", ".rpm", ".appimage", ".bat", ".sh", ".bin", ".jar"}
+    ),
+}
+
+# Every extension covered by a named category above, used to define "misc"
+# below (and nowhere else) -- not itself a valid `file_types` value.
+_ALL_CATEGORIZED_EXTENSIONS: frozenset[str] = frozenset().union(*FILE_TYPE_CATEGORIES.values())
+
+# Pseudo-category matching any file that ISN'T in one of FILE_TYPE_CATEGORIES
+# above -- including files with no extension at all (e.g. "README",
+# "Makefile"). Not a key in FILE_TYPE_CATEGORIES since, unlike the others,
+# it isn't a fixed extension list: it's defined by exclusion from all of
+# them combined, so it has to stay in sync with that dict automatically
+# rather than as a separately-maintained set that could drift out of date.
+MISC_FILE_TYPE = "misc"
+
+# What `find_duplicates`'s `file_types` actually accepts: every concrete
+# category plus the "misc" pseudo-category.
+VALID_FILE_TYPES: frozenset[str] = frozenset(FILE_TYPE_CATEGORIES) | {MISC_FILE_TYPE}
+
+
+def file_matches_types(path: Path, categories: Iterable[str]) -> bool:
+    """True if `path`'s extension falls into any of the named `categories`
+    (see `VALID_FILE_TYPES`) -- the same category-matching rule
+    `find_duplicates`'s `file_types` applies during a scan, exposed here so
+    a caller can apply the identical rule to an already-finished scan's
+    results without re-scanning (e.g. the GUI filtering its results tree
+    by type after the fact, instead of only being able to restrict what
+    gets scanned up front).
+    """
+    ext = path.suffix.lower()
+    categories = set(categories)
+    if MISC_FILE_TYPE in categories and ext not in _ALL_CATEGORIZED_EXTENSIONS:
+        return True
+    return any(ext in FILE_TYPE_CATEGORIES.get(c, frozenset()) for c in categories)
+
 # How many files a hash/confirm stage processes between checkpoint saves
 # (see `find_duplicates`'s `on_checkpoint`) -- frequent enough that a
 # crash or power loss partway through hashing a huge drive loses at most
@@ -63,6 +167,8 @@ def _walk_checkpointed(
     *,
     completed_dirs: set[str],
     already_seen: set[Path],
+    excluded_names: frozenset[str] = frozenset(),
+    extension_filter: Optional[Callable[[str], bool]] = None,
 ) -> Iterator[tuple[str, object]]:
     """Recursively yield every file under `directories`, resumable at
     directory granularity -- used for stage 1's own checkpointing (see
@@ -75,6 +181,22 @@ def _walk_checkpointed(
     symlinks are skipped: a symlink to a file elsewhere isn't a real
     duplicate on disk, it's the same file, so counting it as a "copy"
     would be misleading.
+
+    A subdirectory whose name (lowercased) is in `excluded_names` (see
+    `DEFAULT_EXCLUDED_DIR_NAMES`) is never descended into at all -- not
+    scanned, not stat'd, nothing under it ever yielded -- rather than
+    walked and filtered afterward, since for something like node_modules
+    the whole point is avoiding that walk's cost in the first place. Only
+    applies to directories *encountered during* the walk; a root in
+    `directories` itself is always scanned regardless of its name.
+
+    `extension_filter`, if given, is called with each file's suffix
+    (lowercased) and restricts what's yielded to files it returns True
+    for -- unlike directory exclusion, this doesn't prune any walking (a
+    directory's own extension, if any, is irrelevant to whether it's
+    descended into), it only filters which files are reported. None means
+    no filtering: every file found is yielded, the existing default
+    behavior.
 
     Explicit-stack DFS rather than recursion, so a directory's completion
     can be observed as an event (yielded once every entry in it -- files
@@ -131,6 +253,8 @@ def _walk_checkpointed(
             if is_symlink and not entry.is_dir(follow_symlinks=True):
                 continue
             if entry.is_dir(follow_symlinks=True):
+                if entry.name.lower() in excluded_names:
+                    continue
                 # A real os.stat() call, not entry.stat() -- on Windows,
                 # DirEntry.stat() never populates st_dev/st_ino (they're
                 # always 0: https://docs.python.org/3/library/os.html#os.DirEntry.stat),
@@ -141,6 +265,8 @@ def _walk_checkpointed(
                 try_push(Path(entry.path), os.stat(entry.path))
             elif not is_symlink and entry.is_file(follow_symlinks=False):
                 path = Path(entry.path)
+                if extension_filter is not None and not extension_filter(path.suffix.lower()):
+                    continue
                 if path not in already_seen:
                     yield ("file", path)
         except OSError:
@@ -548,6 +674,8 @@ def find_duplicates(
     large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
     on_checkpoint: Optional[CheckpointCallback] = None,
     on_group_found: Optional[GroupFoundCallback] = None,
+    exclude_dirs: Optional[Iterable[str]] = None,
+    file_types: Optional[Iterable[str]] = None,
 ) -> ScanResult:
     """Find duplicate files across directories using a staged lookup table.
 
@@ -595,6 +723,29 @@ def find_duplicates(
     belongs to a confirmed duplicate folder (which changes how it should
     be rendered) -- a caller should throw away and rebuild from the final
     result rather than trust the incremental groups' rendering as final.
+
+    `exclude_dirs`, if given, replaces `DEFAULT_EXCLUDED_DIR_NAMES` (see
+    there) as the set of directory names never walked into -- pass an
+    empty collection to disable exclusion entirely and walk everything.
+    Matched case-insensitively against a directory's own name, not its
+    full path, so it applies at any depth; never applied to a root in
+    `directories` itself, only to directories encountered during the walk.
+
+    `file_types`, if given, restricts the scan to files matching one or
+    more categories in `VALID_FILE_TYPES` (e.g. `{"images", "video"}`) --
+    every other file is skipped as if it were never there (an
+    unrecognized category name raises `ValueError`). None (the default)
+    applies no filter at all; note this is *not* the same as passing an
+    empty collection, which is a filter matching zero categories -- every
+    file gets skipped and the scan finds nothing. `"misc"` is a
+    pseudo-category matching any file that isn't in one of the concrete
+    categories in `FILE_TYPE_CATEGORIES` (images, audio, video, documents,
+    archives, programs) -- including files with no extension at all, e.g.
+    "README" -- so `{"misc"}` alone finds "everything uncategorized" and
+    `{"images", "misc"}` finds images plus anything uncategorized, but
+    never files belonging to a category that merely wasn't requested (e.g.
+    audio stays excluded in that second example). This only ever narrows
+    what a scan considers; it doesn't change how matches are found.
 
     `cancel_event`, if given, is checked between files; when set, the
     current stage stops early. A group only counts as a confirmed
@@ -665,6 +816,28 @@ def find_duplicates(
     cancelled = False
     cancelled_stage: Optional[str] = None
     workers = workers if workers and workers > 0 else default_workers()
+    excluded_names = frozenset(
+        name.lower() for name in (exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIR_NAMES)
+    )
+
+    extension_filter: Optional[Callable[[str], bool]] = None
+    if file_types is not None:
+        categories = list(file_types)
+        unknown = [c for c in categories if c not in VALID_FILE_TYPES]
+        if unknown:
+            raise ValueError(
+                f"Unknown file type categor{'y' if len(unknown) == 1 else 'ies'}: {', '.join(unknown)} "
+                f"-- valid categories: {', '.join(sorted(VALID_FILE_TYPES))}"
+            )
+        wants_misc = MISC_FILE_TYPE in categories
+        concrete_extensions = frozenset().union(
+            *(FILE_TYPE_CATEGORIES[c] for c in categories if c != MISC_FILE_TYPE)
+        )
+
+        def extension_filter(ext: str) -> bool:
+            if ext in concrete_extensions:
+                return True
+            return wants_misc and ext not in _ALL_CATEGORIZED_EXTENSIONS
 
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -786,7 +959,13 @@ def find_duplicates(
                 )
 
         progress = Progress("Scanning", enabled=show_progress, on_progress=on_progress)
-        for kind, value in _walk_checkpointed(directories, completed_dirs=completed_dirs, already_seen=already_seen):
+        for kind, value in _walk_checkpointed(
+            directories,
+            completed_dirs=completed_dirs,
+            already_seen=already_seen,
+            excluded_names=excluded_names,
+            extension_filter=extension_filter,
+        ):
             if is_cancelled():
                 cancelled = True
                 cancelled_stage = "scanning"

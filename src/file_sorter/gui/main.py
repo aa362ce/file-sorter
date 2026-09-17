@@ -10,6 +10,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -27,7 +28,14 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
-from ..dedupe import DuplicateGroup, ScanResult, files_equal
+from ..dedupe import (
+    DEFAULT_EXCLUDED_DIR_NAMES,
+    VALID_FILE_TYPES,
+    DuplicateGroup,
+    ScanResult,
+    file_matches_types,
+    files_equal,
+)
 from ..folders import FolderGroup
 from ..formatting import human_size
 from ..store import (
@@ -57,6 +65,16 @@ class MainWindow(QMainWindow):
         self._scan_start: Optional[float] = None
         self._resume_run_id: Optional[str] = None
         self._run_id: Optional[str] = None
+        # The finished scan currently on display, and the filter row's
+        # per-category checkboxes -- see _render_results. Re-filtering the
+        # view never re-scans: it's a pure re-render of this same result.
+        self._last_result: Optional[ScanResult] = None
+        self._last_result_cancelled_note = ""
+        self._type_filter_checkboxes: dict[str, QCheckBox] = {}
+        # Which types to scan for at all (empty selection = every file) --
+        # distinct from _type_filter_checkboxes above, which only changes
+        # what's *displayed* from a scan that already covered everything.
+        self._scan_type_checkboxes: dict[str, QCheckBox] = {}
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -92,6 +110,25 @@ class MainWindow(QMainWindow):
         dir_row.addLayout(dir_buttons)
         layout.addLayout(dir_row)
 
+        self.exclude_common_checkbox = QCheckBox("Skip node_modules, virtualenvs && caches")
+        self.exclude_common_checkbox.setChecked(True)
+        self.exclude_common_checkbox.setToolTip(
+            "Skips these directories entirely wherever found, not just at the top level:\n"
+            + ", ".join(sorted(DEFAULT_EXCLUDED_DIR_NAMES))
+        )
+        layout.addWidget(self.exclude_common_checkbox)
+
+        scan_type_row = QHBoxLayout()
+        scan_type_row.addWidget(QLabel("Only scan:"))
+        for type_name in sorted(VALID_FILE_TYPES):
+            checkbox = QCheckBox(type_name.capitalize())
+            self._scan_type_checkboxes[type_name] = checkbox
+            scan_type_row.addWidget(checkbox)
+        scan_type_row.addWidget(QLabel("(leave all unchecked to scan every file)"))
+        scan_type_row.addStretch()
+        scan_type_row.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(scan_type_row)
+
         scan_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan for Duplicates")
         self.scan_btn.clicked.connect(lambda: self._start_scan())
@@ -112,6 +149,18 @@ class MainWindow(QMainWindow):
         scan_row.addWidget(self.status_label)
         scan_row.addWidget(self.history_btn)
         layout.addLayout(scan_row)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter results:"))
+        for type_name in sorted(VALID_FILE_TYPES):
+            checkbox = QCheckBox(type_name.capitalize())
+            checkbox.setEnabled(False)  # enabled once a scan has results to filter -- see _on_scan_finished
+            checkbox.toggled.connect(self._render_results)
+            self._type_filter_checkboxes[type_name] = checkbox
+            filter_row.addWidget(checkbox)
+        filter_row.addStretch()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(filter_row)
 
         self.results_tree = QTreeWidget()
         self.results_tree.setHeaderLabels(["File", "Size"])
@@ -161,6 +210,13 @@ class MainWindow(QMainWindow):
         self.results_tree.clear()
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Resuming scan..." if resume_state else "Scanning...")
+        # The type filter operates on _last_result -- mid-scan, the tree
+        # holds an unfiltered live preview (see _on_groups_found), not a
+        # finished result, so filtering doesn't apply until the next
+        # _on_scan_finished re-enables these and calls _render_results.
+        self._last_result = None
+        for checkbox in self._type_filter_checkboxes.values():
+            checkbox.setEnabled(False)
 
         self._scan_directories = directories
         self._scan_start = time.monotonic()
@@ -171,7 +227,17 @@ class MainWindow(QMainWindow):
         # still leaves recoverable progress behind.
         self._run_id = run_id if run_id is not None else str(time.time())
 
-        self._worker = ScanWorker(directories, resume_state=resume_state, run_id=self._run_id)
+        # None -> find_duplicates' own default (DEFAULT_EXCLUDED_DIR_NAMES);
+        # [] -> exclusion disabled, scan everything.
+        exclude_dirs = None if self.exclude_common_checkbox.isChecked() else []
+        scan_types = {name for name, cb in self._scan_type_checkboxes.items() if cb.isChecked()} or None
+        self._worker = ScanWorker(
+            directories,
+            resume_state=resume_state,
+            run_id=self._run_id,
+            exclude_dirs=exclude_dirs,
+            file_types=scan_types,
+        )
         self._worker.progress.connect(self._on_progress)
         self._worker.group_found.connect(self._on_groups_found)
         self._worker.finished_scan.connect(self._on_scan_finished)
@@ -269,6 +335,40 @@ class MainWindow(QMainWindow):
             save_resume_state(self._run_id, result.resume_state)
         self.resume_btn.setEnabled(latest_resume_run_id() is not None)
 
+        self._last_result = result
+        self._last_result_cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
+        for checkbox in self._type_filter_checkboxes.values():
+            checkbox.setEnabled(True)
+        self._render_results()
+        self.delete_btn.setEnabled(bool(result.groups))
+        self._worker = None
+
+    def _render_results(self) -> None:
+        """(Re)builds the results tree from `self._last_result`, applying
+        whatever type-filter checkboxes are currently checked (see
+        `_type_filter_checkboxes`) -- called both once a scan finishes and
+        again every time the filter selection changes, so switching the
+        filter never requires re-scanning. `None` selected (the default,
+        every checkbox unchecked) means no filter: every group shown.
+
+        Folder-duplicate rows are never filtered by type -- a directory
+        doesn't have a single type the way a file does, so "type" isn't a
+        meaningful question to ask of one; a folder match is either
+        relevant or it isn't, independent of what's inside it.
+        """
+        result = self._last_result
+        if result is None:
+            return
+
+        selected_types = {name for name, cb in self._type_filter_checkboxes.items() if cb.isChecked()}
+
+        def group_matches(group: DuplicateGroup) -> bool:
+            if not selected_types:
+                return True
+            return any(file_matches_types(p, selected_types) for p in group.paths)
+
+        groups_to_show = [g for g in result.groups if group_matches(g)]
+
         # Files inside a confirmed folder match are rendered informational
         # (no checkbox) in their own file-level group below -- their fate
         # is governed entirely by that folder's checkbox instead, since the
@@ -285,17 +385,17 @@ class MainWindow(QMainWindow):
         self.results_tree.blockSignals(True)
         self.results_tree.setUpdatesEnabled(False)
         try:
-            # Discard whatever _on_groups_found streamed in live during the
-            # scan -- those rows are always plain, un-folder-covered groups
-            # (see there), which this authoritative rebuild can now render
-            # correctly since folder analysis has finished. Rebuilding from
-            # scratch rather than reconciling in place is what guarantees
-            # no duplicate/stale rows, at the cost of a brief rebuild here
-            # -- already the bulk/blocked pattern below, so cheap even for
-            # a large result.
+            # Discard whatever's there -- either _on_groups_found's live
+            # preview rows (see there) the first time this runs after a
+            # scan, or this method's own previous filtered render the next
+            # time the filter selection changes. Rebuilding from scratch
+            # rather than reconciling in place is what guarantees no
+            # duplicate/stale rows, at the cost of a brief rebuild here --
+            # already the bulk/blocked pattern below, so cheap even for a
+            # large result.
             self.results_tree.clear()
             headers = [self._build_folder_group_item(fg) for fg in result.folder_groups]
-            headers += [self._build_group_item(g, confirmed_folder_dirs) for g in result.groups]
+            headers += [self._build_group_item(g, confirmed_folder_dirs) for g in groups_to_show]
             self.results_tree.addTopLevelItems(headers)
             for header in headers:
                 header.setExpanded(True)
@@ -305,13 +405,12 @@ class MainWindow(QMainWindow):
 
         folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
-        cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
+        filter_note = f" ({len(groups_to_show)}/{len(result.groups)} shown)" if selected_types else ""
         self.status_label.setText(
-            f"{len(result.groups)} duplicate group(s) found{folder_note}{skipped_note}{cancelled_note}"
+            f"{len(result.groups)} duplicate group(s) found{filter_note}{folder_note}{skipped_note}"
+            f"{self._last_result_cancelled_note}"
         )
-        self.delete_btn.setEnabled(bool(result.groups))
         self._update_reclaimable_label()
-        self._worker = None
 
     def _show_history(self) -> None:
         dialog = HistoryDialog(self)
