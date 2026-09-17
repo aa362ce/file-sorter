@@ -806,11 +806,15 @@ def find_duplicates(
     deferred_groups: list[DuplicateGroup] = []
     if not cancelled:
         resolved_paths: set[Path] = set()
+        full_key_by_path: dict[Path, str] = {}
         if resume_stage == "full_hash":
             assert resume_state is not None
             for full_hash, paths in resume_state.by_full.items():
-                by_full[full_hash] = [Path(p) for p in paths]
-            resolved_paths = {Path(p) for group in resume_state.by_full.values() for p in group}
+                loaded = [Path(p) for p in paths]
+                by_full[full_hash] = loaded
+                for p in loaded:
+                    full_key_by_path[p] = full_hash
+            resolved_paths = set(full_key_by_path)
 
         # Split each (size, partial_hash) bucket into buckets to actually
         # compare now versus very-large-file buckets whose confirmation is
@@ -830,7 +834,14 @@ def find_duplicates(
                 # to avoid double counting those members once it's redone.
                 if bucket_set <= resolved_paths:
                     continue
-                for key in [k for k, v in by_full.items() if bucket_set & set(v)]:
+                # A reverse-index lookup (built once, above) rather than
+                # rescanning every already-confirmed group for each bucket
+                # here -- with tens of thousands of buckets and confirmed
+                # groups both, that rescan is O(buckets x confirmed groups),
+                # which is exactly what turned a large resume's setup into a
+                # multi-minute (or worse) stall with zero visible progress.
+                stale_keys = {full_key_by_path[p] for p in bucket_set if p in full_key_by_path}
+                for key in stale_keys:
                     del by_full[key]
             if large_file_threshold and size >= large_file_threshold:
                 deferred_groups.append(
