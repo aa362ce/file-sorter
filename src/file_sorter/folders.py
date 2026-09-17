@@ -4,10 +4,14 @@ import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
+
+from .progress import Progress
 
 if TYPE_CHECKING:
     from .dedupe import DuplicateGroup
+
+ProgressCallback = Callable[[str, int, Optional[int]], None]
 
 
 @dataclass
@@ -31,6 +35,9 @@ def find_duplicate_folders(
     skipped: Iterable[Path],
     groups: Iterable["DuplicateGroup"],
     scan_roots: Iterable[Path],
+    *,
+    show_progress: bool = False,
+    on_progress: Optional[ProgressCallback] = None,
 ) -> list[FolderGroup]:
     """Find directories whose entire recursive file contents exactly match
     another directory's, built entirely on top of already-computed
@@ -48,6 +55,17 @@ def find_duplicate_folders(
     Nested duplicates are collapsed: if two directories match, matching
     subdirectories under them aren't reported separately, since that's
     already implied by the parent match.
+
+    This is pure in-memory bookkeeping, not I/O, but for a scan root with
+    hundreds of thousands of files (e.g. many `node_modules`/`.venv` trees
+    under a general-purpose "projects" folder) processing every directory
+    still takes long enough to be noticeable -- and previously did so with
+    zero feedback after the file-level stages hit 100%, making a scan that
+    was still genuinely working look identical to a hung one. `on_progress`
+    (throttled the same way as the hashing stages, see `Progress`) reports
+    "Analyzing folders" progress through the same mechanism so the GUI's
+    progress bar keeps moving instead of sitting frozen at the prior
+    stage's final count.
     """
     content_id: dict[Path, tuple[str, bool, int]] = {
         path: (group.file_hash, group.confirmed, group.size) for group in groups for path in group.paths
@@ -89,7 +107,12 @@ def find_duplicate_folders(
     size_by_dir: dict[Path, int] = {}
     count_by_dir: dict[Path, int] = {}
 
+    progress = Progress(
+        "Analyzing folders", total=len(ordered), enabled=show_progress, on_progress=on_progress
+    )
+
     for d in ordered:
+        progress.update()
         entries: list[tuple[str, str, str]] = []
         disqualified = False
         confirmed = True
@@ -126,6 +149,8 @@ def find_duplicate_folders(
         confirmed_by_dir[d] = confirmed
         size_by_dir[d] = total_size
         count_by_dir[d] = total_count
+
+    progress.close()
 
     sig_groups: dict[str, list[Path]] = defaultdict(list)
     for d, sig in signature.items():

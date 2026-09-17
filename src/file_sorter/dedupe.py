@@ -965,7 +965,9 @@ def find_duplicates(
         from .folders import find_duplicate_folders
 
         all_files = [p for paths in by_size.values() for p in paths]
-        folder_groups = find_duplicate_folders(all_files, skipped, groups, directories)
+        folder_groups = find_duplicate_folders(
+            all_files, skipped, groups, directories, show_progress=show_progress, on_progress=on_progress
+        )
         if folder_groups:
             logger.info("Found %d duplicate folder(s)", len(folder_groups))
 
