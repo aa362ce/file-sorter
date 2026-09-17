@@ -219,7 +219,7 @@ def _group_by_content(
     skipped: list[Path] = []
     cancelled = False
     total = sum(len(bucket) for bucket in buckets)
-    progress = Progress(stage_label, total=total, enabled=show_progress)
+    progress = Progress(stage_label, total=total, enabled=show_progress, on_progress=on_progress)
 
     # Append-only logs mirroring `result`/`skipped`, used only to compute
     # cheap since-last-checkpoint deltas below -- see `on_checkpoint` above.
@@ -243,8 +243,6 @@ def _group_by_content(
     def mark_done(path: Path) -> None:
         processed.append(path)
         progress.update()
-        if on_progress:
-            on_progress(stage_label, progress.count, total)
         flush_checkpoint()
 
     def compare(representative: Path, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
@@ -298,11 +296,23 @@ def _group_by_content(
                     if err is not None:
                         logger.debug("Skipping unreadable file %s: %s", other, err)
                         skipped.append(other)
+                        mark_done(other)
                     elif is_equal:
                         matched_others.append(other)
+                        mark_done(other)
                     else:
+                        # Not done yet -- it goes back into `remaining` for
+                        # another round against a new representative (a
+                        # bucket can hold more than one distinct file if its
+                        # members only coincidentally share a size and
+                        # partial hash). Marking it done here too, on every
+                        # round it takes to finally resolve, is what let
+                        # progress.count exceed `total` and flooded
+                        # on_progress with far more signal emissions than
+                        # there are actual files -- exactly what could
+                        # overwhelm the GUI's cross-thread queue and make it
+                        # unresponsive even mid-scan, not just afterward.
                         leftover.append(other)
-                    mark_done(other)
                 record_group(representative, matched_others)
                 remaining = leftover
             if not cancelled and len(remaining) == 1:
@@ -357,7 +367,7 @@ def _hash_parallel(
     skipped: list[Path] = []
     cancelled = False
     total = len(items)
-    progress = Progress(stage_label, total=total, enabled=show_progress)
+    progress = Progress(stage_label, total=total, enabled=show_progress, on_progress=on_progress)
 
     checkpoint_log: list[tuple[K, Path]] = []
     flushed_entries = 0
@@ -392,8 +402,6 @@ def _hash_parallel(
                 checkpoint_log.append((key, path))
             processed.append(path)
             progress.update()
-            if on_progress:
-                on_progress(stage_label, progress.count, total)
         flush_checkpoint()
 
     if workers <= 1 or total <= 1:
@@ -512,10 +520,15 @@ def find_duplicates(
     Files that can't be read (permission-protected, removed mid-scan, ...)
     are skipped rather than aborting the whole scan.
 
-    `on_progress(stage_label, count, total)` is called after every file if
-    given -- `total` is None for stage 1 (unknown until the walk finishes).
-    This is how the GUI drives its progress bar without depending on the
-    terminal-oriented `Progress` class.
+    `on_progress(stage_label, count, total)`, if given, is throttled to the
+    same interval as `Progress`'s own terminal output (see there), not
+    called on every single file -- across a fast stage with many files,
+    calling it unthrottled could invoke it far more often than any UI
+    could usefully redraw for, and for the GUI specifically (a queued
+    cross-thread Qt signal) could flood its event queue faster than the
+    main thread can drain it, making the window appear frozen even though
+    the scan itself is proceeding normally. `total` is None for stage 1
+    (unknown until the walk finishes).
 
     `cancel_event`, if given, is checked between files; when set, the
     current stage stops early. A group only counts as a confirmed
@@ -706,7 +719,7 @@ def find_duplicates(
                     )
                 )
 
-        progress = Progress("Scanning", enabled=show_progress)
+        progress = Progress("Scanning", enabled=show_progress, on_progress=on_progress)
         for kind, value in _walk_checkpointed(directories, completed_dirs=completed_dirs, already_seen=already_seen):
             if is_cancelled():
                 cancelled = True
@@ -730,8 +743,6 @@ def find_duplicates(
             by_size[size].append(path)
             new_size_entries.append((str(size), str(path)))
             progress.update()
-            if on_progress:
-                on_progress("Scanning", progress.count, None)
             flush_stage1_checkpoint()
         flush_stage1_checkpoint(force=True)
         progress.close()
@@ -806,11 +817,15 @@ def find_duplicates(
     deferred_groups: list[DuplicateGroup] = []
     if not cancelled:
         resolved_paths: set[Path] = set()
+        full_key_by_path: dict[Path, str] = {}
         if resume_stage == "full_hash":
             assert resume_state is not None
             for full_hash, paths in resume_state.by_full.items():
-                by_full[full_hash] = [Path(p) for p in paths]
-            resolved_paths = {Path(p) for group in resume_state.by_full.values() for p in group}
+                loaded = [Path(p) for p in paths]
+                by_full[full_hash] = loaded
+                for p in loaded:
+                    full_key_by_path[p] = full_hash
+            resolved_paths = set(full_key_by_path)
 
         # Split each (size, partial_hash) bucket into buckets to actually
         # compare now versus very-large-file buckets whose confirmation is
@@ -830,7 +845,14 @@ def find_duplicates(
                 # to avoid double counting those members once it's redone.
                 if bucket_set <= resolved_paths:
                     continue
-                for key in [k for k, v in by_full.items() if bucket_set & set(v)]:
+                # A reverse-index lookup (built once, above) rather than
+                # rescanning every already-confirmed group for each bucket
+                # here -- with tens of thousands of buckets and confirmed
+                # groups both, that rescan is O(buckets x confirmed groups),
+                # which is exactly what turned a large resume's setup into a
+                # multi-minute (or worse) stall with zero visible progress.
+                stale_keys = {full_key_by_path[p] for p in bucket_set if p in full_key_by_path}
+                for key in stale_keys:
                     del by_full[key]
             if large_file_threshold and size >= large_file_threshold:
                 deferred_groups.append(

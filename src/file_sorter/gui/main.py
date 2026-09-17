@@ -197,18 +197,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
 
-        # Files inside a confirmed folder match are rendered informational
-        # (no checkbox) in their own file-level group below -- their fate
-        # is governed entirely by that folder's checkbox instead, since the
-        # two are computed independently and could otherwise disagree
-        # about which copy is "kept" for the very same file.
-        confirmed_folder_dirs = [d for fg in result.folder_groups if fg.confirmed for d in fg.paths]
-
-        for folder_group in result.folder_groups:
-            self._add_folder_group(folder_group)
-        for group in result.groups:
-            self._add_group(group, confirmed_folder_dirs)
-
+        # Record history/resume state *before* populating the results tree
+        # below -- that population can take a long time on a huge result
+        # set (a whole-drive scan can mean tens of thousands of groups),
+        # and previously ran first, so the scan's completion (and clearing
+        # its resume state) never got recorded until the UI thread finished
+        # that work. If the app was closed or force-killed while still
+        # populating -- which, unbatched, could look indistinguishable from
+        # a genuine hang -- the scan would never show as done, and any
+        # earlier stopped run it consumed would incorrectly stay marked
+        # resumable forever.
         duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
         record_run(self._scan_directories, result, duration, run_id=self._run_id)
 
@@ -225,6 +223,31 @@ class MainWindow(QMainWindow):
         if result.cancelled and result.resume_state is not None:
             save_resume_state(self._run_id, result.resume_state)
         self.resume_btn.setEnabled(latest_resume_run_id() is not None)
+
+        # Files inside a confirmed folder match are rendered informational
+        # (no checkbox) in their own file-level group below -- their fate
+        # is governed entirely by that folder's checkbox instead, since the
+        # two are computed independently and could otherwise disagree
+        # about which copy is "kept" for the very same file.
+        confirmed_folder_dirs = [d for fg in result.folder_groups if fg.confirmed for d in fg.paths]
+
+        # Building potentially tens of thousands of tree items one at a
+        # time -- each triggering its own model-update and, for every
+        # checkbox set, an itemChanged signal (see _on_item_changed) -- is
+        # what froze the UI thread for a very long time on a whole-drive
+        # scan. Block both, build every item off-tree first, and attach
+        # everything in a single bulk call instead.
+        self.results_tree.blockSignals(True)
+        self.results_tree.setUpdatesEnabled(False)
+        try:
+            headers = [self._build_folder_group_item(fg) for fg in result.folder_groups]
+            headers += [self._build_group_item(g, confirmed_folder_dirs) for g in result.groups]
+            self.results_tree.addTopLevelItems(headers)
+            for header in headers:
+                header.setExpanded(True)
+        finally:
+            self.results_tree.setUpdatesEnabled(True)
+            self.results_tree.blockSignals(False)
 
         folder_note = f", {len(result.folder_groups)} duplicate folder(s)" if result.folder_groups else ""
         skipped_note = f", {len(result.skipped)} file(s) skipped" if result.skipped else ""
@@ -243,13 +266,20 @@ class MainWindow(QMainWindow):
 
     # -- results tree -----------------------------------------------------
 
-    def _add_folder_group(self, group: FolderGroup) -> None:
+    def _build_folder_group_item(self, group: FolderGroup) -> QTreeWidgetItem:
         """A confirmed folder group is checkable, same "keep first, check
-        the rest" convention as `_add_group` -- checking a copy and
+        the rest" convention as `_build_group_item` -- checking a copy and
         deleting it removes the whole directory in one action. An
         unconfirmed (large-file) group is informational only: its files
         still appear as regular, individually-deletable groups via
-        `_add_group`, since bulk-deleting an unverified folder isn't safe.
+        `_build_group_item`, since bulk-deleting an unverified folder isn't
+        safe.
+
+        Returns the header item rather than attaching it to the tree
+        itself -- building a whole subtree off-tree and adding it (along
+        with every other top-level item) in one bulk call afterward is
+        what keeps populating a huge result set from freezing the UI
+        thread; see `_on_scan_finished`.
         """
         label = f"\U0001F4C1 Folder duplicate: {len(group.paths)} copies ({group.file_count} files, {human_size(group.size)} each)"
         if not group.confirmed:
@@ -259,7 +289,6 @@ class MainWindow(QMainWindow):
             header.setData(0, Qt.ItemDataRole.UserRole, group)
         else:
             header.setFlags(header.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-        self.results_tree.addTopLevelItem(header)
         for index, path in enumerate(group.paths):
             child = QTreeWidgetItem([str(path), human_size(group.size)])
             if group.confirmed:
@@ -272,16 +301,20 @@ class MainWindow(QMainWindow):
                 # would crash trying to read a group off it otherwise.
                 child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             header.addChild(child)
-        header.setExpanded(True)
+        return header
 
-    def _add_group(self, group: DuplicateGroup, confirmed_folder_dirs: Optional[list[Path]] = None) -> None:
+    def _build_group_item(
+        self, group: DuplicateGroup, confirmed_folder_dirs: Optional[list[Path]] = None
+    ) -> QTreeWidgetItem:
+        """Same off-tree-build-then-bulk-attach approach as
+        `_build_folder_group_item` -- see there and `_on_scan_finished`.
+        """
         confirmed_folder_dirs = confirmed_folder_dirs or []
         label = f"{len(group.paths)} copies, {human_size(group.size)} each"
         if not group.confirmed:
             label += "  (unverified -- large file, checked before deletion)"
         header = QTreeWidgetItem([label, ""])
         header.setData(0, Qt.ItemDataRole.UserRole, group)
-        self.results_tree.addTopLevelItem(header)
 
         def covered(path: Path) -> bool:
             return any(path.is_relative_to(d) for d in confirmed_folder_dirs)
@@ -305,7 +338,7 @@ class MainWindow(QMainWindow):
                 # Default: keep the first (uncovered) copy, check the rest.
                 child.setCheckState(0, Qt.CheckState.Unchecked if index == first_uncovered else Qt.CheckState.Checked)
             header.addChild(child)
-        header.setExpanded(True)
+        return header
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if self._updating_check or item.parent() is None:
