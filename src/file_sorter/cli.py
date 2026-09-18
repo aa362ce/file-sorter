@@ -31,9 +31,11 @@ from .store import (
     latest_resume_run_id,
     load_history,
     load_resume_state,
+    load_run_groups,
     record_run,
     resumable_run_ids,
     save_resume_state,
+    save_run_groups,
 )
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show past run history instead of scanning",
     )
     parser.add_argument(
+        "--show",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Reload and print the full results of a past run (the # index shown by --history) "
+            "instead of scanning -- no directories are re-read. Only available for a run made "
+            "after this option was added; older runs kept only their summary."
+        ),
+    )
+    parser.add_argument(
         "--export-history",
         metavar="PATH",
         help="Export run history to a JSON file instead of scanning",
@@ -235,6 +248,79 @@ def _resolve_resume_run_id(resume_arg: str) -> tuple[Optional[str], Optional[str
     return run_id, None
 
 
+def _print_scan_results(
+    groups: list[DuplicateGroup],
+    folder_groups: list[FolderGroup],
+    skipped_count: int,
+    *,
+    cancelled: bool,
+) -> None:
+    if folder_groups:
+        for fg in folder_groups:
+            label = (
+                f"({fg.file_count} file(s), {human_size(fg.size)} each)"
+                if fg.confirmed
+                else f"({fg.file_count} file(s), {human_size(fg.size)} each, NOT VERIFIED -- large file(s))"
+            )
+            print(f"\nFolder duplicate: {len(fg.paths)} copies {label}:")
+            for path in fg.paths:
+                print(f"  {path}")
+        print(
+            f"\n{len(folder_groups)} duplicate folder(s) found -- their files are also listed "
+            "individually below. --delete removes a confirmed one as a single unit; an "
+            "unverified (large-file) one is handled file by file instead."
+        )
+
+    if not groups:
+        print("No duplicates found." if not cancelled else "Scan cancelled before any duplicates were confirmed.")
+    else:
+        total_wasted = 0
+        deferred_count = 0
+        for group in groups:
+            wasted = group.size * (len(group.paths) - 1)
+            total_wasted += wasted
+            if group.confirmed:
+                label = f"(sha256 {group.file_hash[:12]}...)"
+            else:
+                deferred_count += 1
+                label = "(NOT VERIFIED -- large file, matched by size + partial hash only)"
+            print(f"\n{len(group.paths)} copies, {human_size(group.size)} each {label}:")
+            for path in group.paths:
+                print(f"  {path}")
+
+        note = " (scan cancelled -- partial results)" if cancelled else ""
+        print(f"\n{len(groups)} duplicate group(s), {human_size(total_wasted)} reclaimable{note}.")
+        if deferred_count:
+            print(
+                f"{deferred_count} of those group(s) are large files not fully verified -- "
+                "they will be confirmed before deletion, and a group could turn out to be a "
+                "false match (files that only happen to share a size and partial hash)."
+            )
+
+    if skipped_count:
+        print(f"\nSkipped {skipped_count} unreadable file(s) (permission denied or removed).")
+
+
+def _show_past_run(index: int) -> int:
+    records = list(reversed(load_history()))
+    if index < 1 or index > len(records):
+        print(f"No run #{index} in history -- run --history to see valid indexes.")
+        return 1
+
+    record = records[index - 1]
+    run_id = str(record.timestamp)
+    loaded = load_run_groups(run_id)
+    if loaded is None:
+        print(f"Run #{index} has no saved detailed results to show (only its summary is kept).")
+        return 1
+
+    groups, folder_groups = loaded
+    when = datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d %H:%M")
+    print(f"Run #{index} -- {when} -- {', '.join(record.directories)}")
+    _print_scan_results(groups, folder_groups, record.skipped, cancelled=record.cancelled)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -267,6 +353,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Imported {added} new run(s) from {path}")
         return 0
+
+    if args.show is not None:
+        return _show_past_run(args.show)
 
     resume_state = None
     resume_run_id = None
@@ -343,6 +432,12 @@ def main(argv: list[str] | None = None) -> int:
     duration = time.monotonic() - start
 
     record_run(directories, result, duration, run_id=run_id)
+    # Saved separately from the summary above so `--show` can later reload
+    # and reprint this exact result without re-scanning -- see
+    # `_show_past_run`. Uses the unfiltered result (not the --min-size
+    # filtered lists below), so a run made with --min-size doesn't lose
+    # the smaller groups it chose not to print this time.
+    save_run_groups(run_id, result)
     # Whatever checkpoint(s) this run saved along the way (or, if resuming,
     # the older stopped run it consumed) are done with now -- either the
     # scan finished, or it's cancelled again and a fresh resume state is
@@ -355,54 +450,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.min_size:
         folder_groups = [g for g in folder_groups if g.size >= args.min_size]
 
-    if folder_groups:
-        for fg in folder_groups:
-            label = (
-                f"({fg.file_count} file(s), {human_size(fg.size)} each)"
-                if fg.confirmed
-                else f"({fg.file_count} file(s), {human_size(fg.size)} each, NOT VERIFIED -- large file(s))"
-            )
-            print(f"\nFolder duplicate: {len(fg.paths)} copies {label}:")
-            for path in fg.paths:
-                print(f"  {path}")
-        print(
-            f"\n{len(folder_groups)} duplicate folder(s) found -- their files are also listed "
-            "individually below. --delete removes a confirmed one as a single unit; an "
-            "unverified (large-file) one is handled file by file instead."
-        )
-
     groups = result.groups
     if args.min_size:
         groups = [g for g in groups if g.size >= args.min_size]
 
-    if not groups:
-        print("No duplicates found." if not result.cancelled else "Scan cancelled before any duplicates were confirmed.")
-    else:
-        total_wasted = 0
-        deferred_count = 0
-        for group in groups:
-            wasted = group.size * (len(group.paths) - 1)
-            total_wasted += wasted
-            if group.confirmed:
-                label = f"(sha256 {group.file_hash[:12]}...)"
-            else:
-                deferred_count += 1
-                label = "(NOT VERIFIED -- large file, matched by size + partial hash only)"
-            print(f"\n{len(group.paths)} copies, {human_size(group.size)} each {label}:")
-            for path in group.paths:
-                print(f"  {path}")
-
-        note = " (scan cancelled -- partial results)" if result.cancelled else ""
-        print(f"\n{len(groups)} duplicate group(s), {human_size(total_wasted)} reclaimable{note}.")
-        if deferred_count:
-            print(
-                f"{deferred_count} of those group(s) are large files not fully verified -- "
-                "they will be confirmed before deletion, and a group could turn out to be a "
-                "false match (files that only happen to share a size and partial hash)."
-            )
-
-    if result.skipped:
-        print(f"\nSkipped {len(result.skipped)} unreadable file(s) (permission denied or removed).")
+    _print_scan_results(groups, folder_groups, len(result.skipped), cancelled=result.cancelled)
 
     if result.cancelled and result.resume_state is not None:
         print("\nRun 'file-sorter --resume' to continue this scan where it left off.")

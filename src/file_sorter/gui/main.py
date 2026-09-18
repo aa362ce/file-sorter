@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -42,11 +43,13 @@ from ..folders import FolderGroup
 from ..formatting import human_size
 from ..store import (
     ResumeState,
+    RunRecord,
     clear_resume_state,
     latest_resume_run_id,
     load_resume_state,
     record_run,
     save_resume_state,
+    save_run_groups,
 )
 from .file_explorer import FileExplorer
 from .history_dialog import HistoryDialog
@@ -275,6 +278,27 @@ class MainWindow(QMainWindow):
             self.dir_list.addItem(directory)
         self._start_scan(resume_state=resume_state, run_id=run_id)
 
+    def _load_from_history(
+        self, record: RunRecord, groups: list[DuplicateGroup], folder_groups: list[FolderGroup]
+    ) -> None:
+        """Re-render a past run's saved results without re-scanning --
+        called when History's "Load Selected" picks a run with saved
+        detail (see HistoryDialog.load_requested). Only display state
+        changes here; nothing about a scan in progress or resumability is
+        touched, since loading isn't a scan.
+        """
+        self.dir_list.clear()
+        for directory in record.directories:
+            self.dir_list.addItem(directory)
+
+        self._last_result = ScanResult(groups=groups, skipped=[], folder_groups=folder_groups)
+        when = datetime.fromtimestamp(record.timestamp).strftime("%Y-%m-%d %H:%M")
+        self._last_result_cancelled_note = f" (loaded from {when} run, {record.skipped} skipped at the time)"
+        for checkbox in self._type_filter_checkboxes.values():
+            checkbox.setEnabled(True)
+        self._render_results()
+        self.delete_btn.setEnabled(bool(groups or folder_groups))
+
     def _cancel_scan(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
@@ -333,6 +357,10 @@ class MainWindow(QMainWindow):
         # resumable forever.
         duration = time.monotonic() - self._scan_start if self._scan_start is not None else 0.0
         record_run(self._scan_directories, result, duration, run_id=self._run_id)
+        # Saved separately from the summary above so History's "Load
+        # Selected" can later reload and re-render this exact result
+        # without re-scanning -- see _load_from_history.
+        save_run_groups(self._run_id, result)
 
         # Whichever stopped run this attempt just consumed (if any), and any
         # mid-scan checkpoint saved under this attempt's own id, are both
@@ -446,6 +474,7 @@ class MainWindow(QMainWindow):
     def _show_history(self) -> None:
         dialog = HistoryDialog(self)
         dialog.resume_requested.connect(self._resume_from_history)
+        dialog.load_requested.connect(self._load_from_history)
         dialog.exec()
 
     # -- results tree -----------------------------------------------------
