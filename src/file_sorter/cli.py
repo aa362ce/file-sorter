@@ -19,7 +19,7 @@ from .dedupe import (
     DuplicateGroup,
     default_workers,
     files_equal,
-    find_duplicates,
+    scan_or_reuse,
 )
 from .folders import FolderGroup
 from .formatting import human_size
@@ -415,8 +415,13 @@ def main(argv: list[str] | None = None) -> int:
     previous_handler = signal.signal(signal.SIGINT, handle_sigint)
     start = time.monotonic()
     try:
-        result = find_duplicates(
+        # scan_or_reuse first checks (cheaply, via a stat-only walk) whether
+        # these exact directories are unchanged since a previous scan; if
+        # so, it replays that scan's saved results instead of rehashing
+        # everything -- see there.
+        result = scan_or_reuse(
             directories,
+            run_id=run_id,
             show_progress=not args.quiet,
             cancel_event=cancel_event,
             resume_state=resume_state,
@@ -430,6 +435,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         signal.signal(signal.SIGINT, previous_handler)
     duration = time.monotonic() - start
+    if result.reused_run_id is not None and not args.quiet:
+        print("Nothing changed since the last scan of these directories -- reused those results.", file=sys.stderr)
 
     record_run(directories, result, duration, run_id=run_id)
     # Saved separately from the summary above so `--show` can later reload

@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
 from ..formatting import human_size
 from ..store import (
     RunRecord,
+    clear_history,
+    delete_runs,
     export_history,
     import_history,
     load_history,
@@ -70,10 +72,17 @@ class HistoryDialog(QDialog):
         self.export_btn.clicked.connect(self._export)
         import_btn = QPushButton("Import...")
         import_btn.clicked.connect(self._import)
+        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn.clicked.connect(self._delete_selected)
+        self.delete_btn.setEnabled(False)
+        self.clear_btn = QPushButton("Clear All...")
+        self.clear_btn.clicked.connect(self._clear_all)
         button_row.addWidget(self.resume_btn)
         button_row.addWidget(self.load_btn)
         button_row.addWidget(self.export_btn)
         button_row.addWidget(import_btn)
+        button_row.addWidget(self.delete_btn)
+        button_row.addWidget(self.clear_btn)
         button_row.addStretch()
         layout.addLayout(button_row)
 
@@ -120,10 +129,16 @@ class HistoryDialog(QDialog):
         row = self.table.currentRow()
         return self._records[row] if 0 <= row < len(self._records) else None
 
+    def _selected_records(self) -> list[RunRecord]:
+        rows = sorted(index.row() for index in self.table.selectionModel().selectedRows())
+        return [self._records[row] for row in rows if 0 <= row < len(self._records)]
+
     def _update_button_states(self) -> None:
         self.resume_btn.setEnabled(self._is_resumable(self.table.currentRow()))
         self.load_btn.setEnabled(self._selected_record() is not None)
         self.export_btn.setText("Export Selected..." if self._selected_record() is not None else "Export All...")
+        self.delete_btn.setEnabled(bool(self._selected_records()))
+        self.clear_btn.setEnabled(bool(self._records))
 
     def _resume_selected(self) -> None:
         row = self.table.currentRow()
@@ -188,3 +203,37 @@ class HistoryDialog(QDialog):
             return
         self._reload()
         QMessageBox.information(self, "Import complete", f"Imported {added} new run(s) from {path_str}")
+
+    def _delete_selected(self) -> None:
+        records = self._selected_records()
+        if not records:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Confirm deletion",
+            f"Permanently delete {len(records)} run(s) from history? This also removes any saved "
+            "detailed results and resumable progress for them.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        run_ids = [str(record.timestamp) for record in records]
+        removed = delete_runs(run_ids)
+        self._reload()
+        QMessageBox.information(self, "Deleted", f"Removed {removed} run(s) from history.")
+
+    def _clear_all(self) -> None:
+        if not self._records:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Confirm clear history",
+            "Permanently delete ALL run history, saved detailed results, and resumable progress? "
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        removed = clear_history()
+        self._reload()
+        QMessageBox.information(self, "History cleared", f"Removed {removed} run(s) from history.")

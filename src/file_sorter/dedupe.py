@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, TypeVar
 
 from .progress import Progress
-from .store import CheckpointDelta, ResumeState
+from .store import CheckpointDelta, ResumeState, find_reusable_run, load_run_groups, save_scan_manifest
 
 if TYPE_CHECKING:
     from .folders import FolderGroup
@@ -731,10 +731,40 @@ class ScanResult:
     cancelled: bool = False
     resume_state: Optional[ResumeState] = None
     folder_groups: list["FolderGroup"] = field(default_factory=list)
+    # Set to the run_id whose saved results were replayed instead of
+    # rescanning, when `scan_or_reuse` finds nothing changed since that
+    # run (see there). None for a normally-executed scan.
+    reused_run_id: Optional[str] = None
 
 
 def _partial_key(size: int, partial_hash: str) -> str:
     return f"{size}:{partial_hash}"
+
+
+def _build_extension_filter(file_types: Optional[Iterable[str]]) -> Optional[Callable[[str], bool]]:
+    """Shared by `find_duplicates` and `quick_scan_manifest` so both apply
+    identical file-type filtering -- if they ever diverged, a manifest
+    built under one filter could be wrongly compared against a scan done
+    under another, corrupting the reuse check in `scan_or_reuse`.
+    """
+    if file_types is None:
+        return None
+    categories = list(file_types)
+    unknown = [c for c in categories if c not in VALID_FILE_TYPES]
+    if unknown:
+        raise ValueError(
+            f"Unknown file type categor{'y' if len(unknown) == 1 else 'ies'}: {', '.join(unknown)} "
+            f"-- valid categories: {', '.join(sorted(VALID_FILE_TYPES))}"
+        )
+    wants_misc = MISC_FILE_TYPE in categories
+    concrete_extensions = frozenset().union(*(FILE_TYPE_CATEGORIES[c] for c in categories if c != MISC_FILE_TYPE))
+
+    def extension_filter(ext: str) -> bool:
+        if ext in concrete_extensions:
+            return True
+        return wants_misc and ext not in _ALL_CATEGORIZED_EXTENSIONS
+
+    return extension_filter
 
 
 def _resume_roots_match(resume_state: ResumeState, directories: list[Path]) -> bool:
@@ -926,24 +956,7 @@ def find_duplicates(
         name.lower() for name in (exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIR_NAMES)
     )
 
-    extension_filter: Optional[Callable[[str], bool]] = None
-    if file_types is not None:
-        categories = list(file_types)
-        unknown = [c for c in categories if c not in VALID_FILE_TYPES]
-        if unknown:
-            raise ValueError(
-                f"Unknown file type categor{'y' if len(unknown) == 1 else 'ies'}: {', '.join(unknown)} "
-                f"-- valid categories: {', '.join(sorted(VALID_FILE_TYPES))}"
-            )
-        wants_misc = MISC_FILE_TYPE in categories
-        concrete_extensions = frozenset().union(
-            *(FILE_TYPE_CATEGORIES[c] for c in categories if c != MISC_FILE_TYPE)
-        )
-
-        def extension_filter(ext: str) -> bool:
-            if ext in concrete_extensions:
-                return True
-            return wants_misc and ext not in _ALL_CATEGORIZED_EXTENSIONS
+    extension_filter = _build_extension_filter(file_types)
 
     def is_cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
@@ -1346,3 +1359,134 @@ def find_duplicates(
         resume_state=new_resume_state,
         folder_groups=folder_groups,
     )
+
+
+def quick_scan_manifest(
+    directories: Iterable[Path],
+    *,
+    exclude_dirs: Optional[Iterable[str]] = None,
+    exclude_temp_files: bool = True,
+    file_types: Optional[Iterable[str]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> Optional[dict[str, tuple[int, float]]]:
+    """Cheaply stat every file under `directories` -- same filtering rules
+    as `find_duplicates` (`exclude_dirs`/`exclude_temp_files`/`file_types`
+    all mean exactly what they do there) -- without reading or hashing any
+    file content, returning `{str(path): (size, mtime)}`.
+
+    This is stage 1's own walk with the hashing stages left out, used by
+    `scan_or_reuse` to cheaply check whether a directory tree has changed
+    at all since a previous scan, so that scan's saved results can be
+    replayed instead of rehashing everything unchanged.
+
+    Returns None if `cancel_event` fires before the walk finishes;
+    otherwise always a dict (empty if there are no matching files), even
+    if some individual files couldn't be stat'd (permission errors etc.
+    are skipped the same way `find_duplicates` skips unreadable files).
+    """
+    excluded_names = frozenset(
+        name.lower() for name in (exclude_dirs if exclude_dirs is not None else DEFAULT_EXCLUDED_DIR_NAMES)
+    )
+    extension_filter = _build_extension_filter(file_types)
+
+    manifest: dict[str, tuple[int, float]] = {}
+    count = 0
+    for kind, value in _walk_checkpointed(
+        directories,
+        completed_dirs=set(),
+        already_seen=set(),
+        excluded_names=excluded_names,
+        extension_filter=extension_filter,
+        exclude_temp_files=exclude_temp_files,
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if kind != "file":
+            continue
+        path = value
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        manifest[str(path)] = (st.st_size, st.st_mtime)
+        count += 1
+        if on_progress is not None and count % 500 == 0:
+            on_progress("Checking for changes", count, None)
+    return manifest
+
+
+def scan_or_reuse(
+    directories: Iterable[Path],
+    *,
+    run_id: str,
+    show_progress: bool = False,
+    on_progress: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+    resume_state: Optional[ResumeState] = None,
+    workers: Optional[int] = None,
+    large_file_threshold: Optional[int] = LARGE_FILE_THRESHOLD,
+    on_checkpoint: Optional[CheckpointCallback] = None,
+    on_group_found: Optional[GroupFoundCallback] = None,
+    exclude_dirs: Optional[Iterable[str]] = None,
+    exclude_temp_files: bool = True,
+    file_types: Optional[Iterable[str]] = None,
+) -> ScanResult:
+    """Like `find_duplicates`, but first checks whether this exact set of
+    directories was scanned before with nothing having changed since --
+    same files present, same sizes, same modification times (see
+    `quick_scan_manifest` and `store.find_reusable_run`) -- and if so,
+    replays that earlier scan's saved duplicate groups instantly instead
+    of rehashing every file.
+
+    Only attempted for a fresh scan (`resume_state` is None); a resumed
+    scan always proceeds normally, since it's continuing a specific
+    interrupted attempt rather than starting a new one. On any
+    difference (or no previous scan of this directory set at all), falls
+    back to a real `find_duplicates` call, then saves the manifest just
+    collected under `run_id` so the *next* scan of these directories can
+    be checked against it -- callers don't need to save it separately.
+
+    `run_id` identifies the caller's scan attempt the same way it does
+    for `store.checkpoint_progress`/`save_run_groups`; it's required here
+    (unlike `find_duplicates`) because it's also used as the manifest's
+    key once a fresh scan completes.
+    """
+    directories = list(directories)
+    manifest: Optional[dict[str, tuple[int, float]]] = None
+    if resume_state is None:
+        manifest = quick_scan_manifest(
+            directories,
+            exclude_dirs=exclude_dirs,
+            exclude_temp_files=exclude_temp_files,
+            file_types=file_types,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+        )
+        if manifest is None:
+            return ScanResult(groups=[], skipped=[], cancelled=True)
+
+        reused_run_id = find_reusable_run([str(d) for d in directories], manifest)
+        if reused_run_id is not None:
+            loaded = load_run_groups(reused_run_id)
+            if loaded is not None:
+                groups, folder_groups = loaded
+                return ScanResult(groups=groups, skipped=[], folder_groups=folder_groups, reused_run_id=reused_run_id)
+
+    result = find_duplicates(
+        directories,
+        show_progress=show_progress,
+        on_progress=on_progress,
+        cancel_event=cancel_event,
+        resume_state=resume_state,
+        workers=workers,
+        large_file_threshold=large_file_threshold,
+        on_checkpoint=on_checkpoint,
+        on_group_found=on_group_found,
+        exclude_dirs=exclude_dirs,
+        exclude_temp_files=exclude_temp_files,
+        file_types=file_types,
+    )
+    if manifest is not None and not result.cancelled:
+        save_scan_manifest([str(d) for d in directories], run_id, manifest)
+    return result

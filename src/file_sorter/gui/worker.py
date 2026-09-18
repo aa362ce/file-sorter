@@ -6,7 +6,7 @@ from typing import Iterable, Optional
 
 from PySide6.QtCore import QThread, Signal
 
-from ..dedupe import ScanResult, find_duplicates
+from ..dedupe import ScanResult, find_duplicates, scan_or_reuse
 from ..store import CheckpointDelta, ResumeState, checkpoint_progress
 
 
@@ -48,8 +48,7 @@ class ScanWorker(QThread):
             checkpoint_progress(self._run_id, delta)
 
     def run(self) -> None:
-        result = find_duplicates(
-            self._directories,
+        common_kwargs = dict(
             on_progress=lambda stage, count, total: self.progress.emit(stage, count, total),
             cancel_event=self._cancel_event,
             resume_state=self._resume_state,
@@ -59,4 +58,12 @@ class ScanWorker(QThread):
             exclude_temp_files=self._exclude_temp_files,
             file_types=self._file_types,
         )
+        if self._run_id is not None:
+            # scan_or_reuse needs a run_id to attribute a freshly-collected
+            # manifest to (see there) -- checks whether this directory set
+            # is unchanged since a previous scan, and if so replays that
+            # scan's saved results instead of rehashing everything.
+            result = scan_or_reuse(self._directories, run_id=self._run_id, **common_kwargs)
+        else:
+            result = find_duplicates(self._directories, **common_kwargs)
         self.finished_scan.emit(result)
