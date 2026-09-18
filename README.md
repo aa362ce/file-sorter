@@ -141,6 +141,29 @@ individual file listing above. An unverified (large-file) folder isn't
 bulk-deleted; its files are handled individually instead, same as any
 other large-file group.
 
+### Moving duplicates instead of deleting
+
+`--move-to DIR` moves duplicates into `DIR` instead of sending them to the
+Trash -- same selection rules as `--delete` (first copy in each group kept
+in place, a confirmed duplicate folder moved as a single unit, large-file
+groups verified right before moving), and it accepts the same `--yes` and
+`--dry-run`:
+
+```bash
+file-sorter D:\ --move-to D:\Duplicates
+file-sorter D:\ --move-to D:\Duplicates --yes
+file-sorter D:\ --move-to D:\Duplicates --dry-run
+```
+
+Each moved file or folder is placed at its original absolute path
+underneath `DIR`, so the source hierarchy is preserved and duplicates from
+different folders (or different drives) never collide by name -- e.g. a
+duplicate found at `D:\Photos\a.jpg` lands at `DIR\D\Photos\a.jpg`. `DIR`
+is created if it doesn't already exist. If a mirrored destination path
+already exists (e.g. from a previous `--move-to` run), that item is
+skipped and reported rather than overwritten. `--delete` and `--move-to`
+are mutually exclusive.
+
 ### Progress and logging
 
 A live progress line (files scanned, then quick-hash and full-hash

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import signal
 import sys
 import threading
@@ -142,19 +143,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--move-to",
+        metavar="DIR",
+        help=(
+            "Move duplicates into DIR instead of deleting them -- keeps the first copy in "
+            "each group in place (same convention as --delete) and moves the rest, "
+            "mirroring each moved file's/folder's original absolute path underneath DIR "
+            "(e.g. a file from D:\\Photos\\a.jpg lands at DIR\\D\\Photos\\a.jpg) so "
+            "duplicates from different source folders never collide by name and stay easy "
+            "to trace back. DIR is created if it doesn't exist. Mutually exclusive with "
+            "--delete."
+        ),
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",
-        help="Skip the confirmation prompt before deleting (only meaningful with --delete)",
+        help="Skip the confirmation prompt before deleting/moving (only meaningful with --delete/--move-to)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
-            "Preview what --delete would do without deleting anything -- including running "
-            "the pre-deletion verification for large-file groups, so the preview shows "
+            "Preview what --delete/--move-to would do without touching anything -- including "
+            "running the pre-deletion verification for large-file groups, so the preview shows "
             "exactly which files would be skipped, not just what's planned. Implies --yes "
-            "(nothing is deleted, so there's nothing to confirm). Only meaningful with --delete."
+            "(nothing happens, so there's nothing to confirm). Only meaningful with "
+            "--delete/--move-to."
         ),
     )
     parser.add_argument(
@@ -324,6 +339,10 @@ def _show_past_run(index: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.delete and args.move_to:
+        print("Error: --delete and --move-to are mutually exclusive")
+        return 1
+
     log_level = logging.WARNING
     if args.verbose == 1:
         log_level = logging.INFO
@@ -469,7 +488,66 @@ def main(argv: list[str] | None = None) -> int:
     if args.delete and (groups or result.folder_groups):
         _delete_duplicates(groups, result.folder_groups, skip_confirmation=args.yes, dry_run=args.dry_run)
 
+    if args.move_to and (groups or result.folder_groups):
+        dest_root = Path(args.move_to).expanduser().resolve()
+        _move_duplicates(
+            groups,
+            result.folder_groups,
+            dest_root,
+            skip_confirmation=args.yes,
+            dry_run=args.dry_run,
+        )
+
     return 0
+
+
+def _plan_duplicates_to_remove(
+    groups: list[DuplicateGroup],
+    folder_groups: list[FolderGroup],
+) -> tuple[list[tuple[FolderGroup, Path]], list[tuple[DuplicateGroup, Path]]]:
+    """Pick which folder/file copies --delete and --move-to both act on.
+
+    Only a *confirmed* folder group can be handled as a single unit -- every
+    file inside one was already individually confirmed, so acting on the
+    whole directory needs no further verification. An unconfirmed
+    (deferred, large-file) folder group is left alone here entirely; its
+    files fall through to the per-file plan below, which already verifies
+    each one before it's touched.
+    """
+    folders_to_remove = [(fg, path) for fg in folder_groups if fg.confirmed for path in fg.paths[1:]]
+    remove_dirs = [path for _fg, path in folders_to_remove]
+
+    def under_any(path: Path, roots: list[Path]) -> bool:
+        return any(path.is_relative_to(root) for root in roots)
+
+    # Same convention as the GUI: keep the first file in each group, act on
+    # the rest -- but a file's own group.paths[0] pick is independent of
+    # which *folder* copy is being kept, so re-derive "keep/remove" among
+    # only the paths NOT already covered by a folder-level removal above,
+    # rather than blindly trusting group.paths[0]/[1:]. Otherwise a file
+    # whose file-level "kept" copy happens to sit in a folder being
+    # bulk-removed could end up with every copy gone.
+    files_to_remove: list[tuple[DuplicateGroup, Path]] = []
+    for group in groups:
+        remaining = [p for p in group.paths if not under_any(p, remove_dirs)]
+        if len(remaining) < 2:
+            continue  # already fully handled by a folder-level removal, or only one copy is left
+        files_to_remove.extend((group, path) for path in remaining[1:])
+
+    return folders_to_remove, files_to_remove
+
+
+def _mirrored_path(path: Path, dest_root: Path) -> Path:
+    """Where `path` lands under `dest_root`, preserving its full source hierarchy.
+
+    Mirrors the drive/anchor too (e.g. D:\\Photos\\a.jpg -> dest_root/D/Photos/a.jpg,
+    /home/user/a.jpg -> dest_root/home/user/a.jpg) so duplicates that happen to
+    share a relative path under different scanned directories -- or different
+    drives entirely -- never collide at the destination.
+    """
+    drive = path.drive.rstrip(":")
+    tail = path.relative_to(path.anchor)
+    return dest_root / drive / tail if drive else dest_root / tail
 
 
 def _delete_duplicates(
@@ -479,31 +557,7 @@ def _delete_duplicates(
     skip_confirmation: bool,
     dry_run: bool = False,
 ) -> None:
-    # Only a *confirmed* folder group can be deleted as a single unit --
-    # every file inside one was already individually confirmed, so trashing
-    # the whole directory needs no further verification. An unconfirmed
-    # (deferred, large-file) folder group is left alone here entirely; its
-    # files fall through to the per-file plan below, which already
-    # verifies each one before deleting it.
-    folders_to_delete = [(fg, path) for fg in folder_groups if fg.confirmed for path in fg.paths[1:]]
-    delete_dirs = [path for _fg, path in folders_to_delete]
-
-    def under_any(path: Path, roots: list[Path]) -> bool:
-        return any(path.is_relative_to(root) for root in roots)
-
-    # Same convention as the GUI: keep the first file in each group, delete
-    # the rest -- but a file's own group.paths[0] pick is independent of
-    # which *folder* copy is being kept, so re-derive "keep/delete" among
-    # only the paths NOT already covered by a folder-level deletion above,
-    # rather than blindly trusting group.paths[0]/[1:]. Otherwise a file
-    # whose file-level "kept" copy happens to sit in a folder being
-    # bulk-deleted could end up with every copy removed.
-    files_to_delete: list[tuple[DuplicateGroup, Path]] = []
-    for group in groups:
-        remaining = [p for p in group.paths if not under_any(p, delete_dirs)]
-        if len(remaining) < 2:
-            continue  # already fully handled by a folder-level deletion, or only one copy is left
-        files_to_delete.extend((group, path) for path in remaining[1:])
+    folders_to_delete, files_to_delete = _plan_duplicates_to_remove(groups, folder_groups)
 
     if not folders_to_delete and not files_to_delete:
         return
@@ -567,6 +621,96 @@ def _delete_duplicates(
     print(f"\n{verb} {deleted_folders} folder(s) and {deleted_files} file(s) to Trash.")
     if failures:
         label = "would not be deleted" if dry_run else "were not deleted"
+        print(f"{len(failures)} item(s) {label}:")
+        for line in failures:
+            print(f"  {line}")
+
+
+def _move_duplicates(
+    groups: list[DuplicateGroup],
+    folder_groups: list[FolderGroup],
+    dest_root: Path,
+    *,
+    skip_confirmation: bool,
+    dry_run: bool = False,
+) -> None:
+    folders_to_move, files_to_move = _plan_duplicates_to_remove(groups, folder_groups)
+
+    if not folders_to_move and not files_to_move:
+        return
+
+    if dry_run:
+        print(f"\nDry run -- nothing will actually be moved to {dest_root}.")
+    elif not skip_confirmation:
+        parts = []
+        if folders_to_move:
+            parts.append(f"{len(folders_to_move)} folder(s)")
+        if files_to_move:
+            parts.append(f"{len(files_to_move)} file(s)")
+        try:
+            answer = input(f"\nMove {' and '.join(parts)} to {dest_root}? [y/N] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer not in ("y", "yes"):
+            print("Aborted -- nothing moved.")
+            return
+
+    if not dry_run:
+        dest_root.mkdir(parents=True, exist_ok=True)
+
+    moved_folders = 0
+    moved_files = 0
+    failures = []
+
+    for _fg, path in folders_to_move:
+        dest = _mirrored_path(path, dest_root)
+        if dest.exists():
+            failures.append(f"{path}: destination {dest} already exists -- skipped")
+            continue
+        if dry_run:
+            print(f"  would move folder: {path} -> {dest}")
+            moved_folders += 1
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(dest))
+            moved_folders += 1
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+
+    for group, path in files_to_move:
+        if not group.confirmed:
+            try:
+                verified = files_equal(group.paths[0], path)
+            except OSError as exc:
+                failures.append(f"{path}: could not verify against kept file: {exc}")
+                continue
+            if not verified:
+                skip_verb = "would be skipped" if dry_run else "skipped"
+                failures.append(
+                    f"{path}: not verified as an actual duplicate of the kept file -- "
+                    f"{skip_verb} rather than risk moving a non-duplicate"
+                )
+                continue
+        dest = _mirrored_path(path, dest_root)
+        if dest.exists():
+            failures.append(f"{path}: destination {dest} already exists -- skipped")
+            continue
+        if dry_run:
+            print(f"  would move: {path} -> {dest}")
+            moved_files += 1
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(dest))
+            moved_files += 1
+        except OSError as exc:
+            failures.append(f"{path}: {exc}")
+
+    verb = "Would move" if dry_run else "Moved"
+    print(f"\n{verb} {moved_folders} folder(s) and {moved_files} file(s) to {dest_root}.")
+    if failures:
+        label = "would not be moved" if dry_run else "were not moved"
         print(f"{len(failures)} item(s) {label}:")
         for line in failures:
             print(f"  {line}")
