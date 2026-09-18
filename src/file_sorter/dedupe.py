@@ -103,13 +103,28 @@ DEFAULT_EXCLUDED_FILE_NAMES = frozenset(
 DEFAULT_EXCLUDED_FILE_EXTENSIONS = frozenset({".tmp", ".temp", ".swp", ".swo", ".bak"})
 
 
+def _suffix(name: str) -> str:
+    """Same result as `Path(name).suffix` for a bare filename (no
+    directory components) -- e.g. '.tmp' for 'foo.tmp', '' for '.bashrc'
+    or 'noext' -- computed as a plain string op instead of constructing a
+    whole Path just to read one property. Path() parses drive/root/parts
+    out of the entire string, which is real, measurable overhead when
+    it's done once per file on a scan of millions of files for a result
+    this cheap to derive directly (profiled: this alone was >10% of a
+    1M-file scan's total time, entirely inside `Path()`'s own parsing,
+    not the suffix lookup itself).
+    """
+    dot = name.rfind(".")
+    return name[dot:] if 0 < dot < len(name) - 1 else ""
+
+
 def _is_default_excluded_file(name: str) -> bool:
     lowered = name.lower()
     if lowered in DEFAULT_EXCLUDED_FILE_NAMES:
         return True
     if lowered.endswith("~"):
         return True
-    return Path(lowered).suffix in DEFAULT_EXCLUDED_FILE_EXTENSIONS
+    return _suffix(lowered) in DEFAULT_EXCLUDED_FILE_EXTENSIONS
 
 # Extensions (lowercase, with the leading dot) making up each named file
 # type category -- see `find_duplicates`'s `file_types`. Not exhaustive,
@@ -319,11 +334,17 @@ def _walk_checkpointed(
                 # the entire tree below the top level.
                 try_push(Path(entry.path), os.stat(entry.path))
             elif not is_symlink and entry.is_file(follow_symlinks=False):
-                path = Path(entry.path)
                 if exclude_temp_files and _is_default_excluded_file(entry.name):
                     continue
-                if extension_filter is not None and not extension_filter(path.suffix.lower()):
+                if extension_filter is not None and not extension_filter(_suffix(entry.name).lower()):
                     continue
+                # Path() constructed only once a file actually clears both
+                # filters above -- both filters work off `entry.name`
+                # directly (a plain string DirEntry already has for free)
+                # instead of needing this Path built first, so a file
+                # that's excluded or filtered out by type never pays for
+                # a Path() construction it doesn't end up needing.
+                path = Path(entry.path)
                 if path not in already_seen:
                     yield ("file", path)
         except OSError:
@@ -480,10 +501,26 @@ def _group_by_content(
         except OSError as exc:
             return other, None, exc
 
-    def record_group(representative: Path, matched_others: list[Path]) -> None:
+    def compare_cached(data: bytes, other: Path) -> tuple[Path, Optional[bool], Optional[OSError]]:
+        try:
+            return other, other.read_bytes() == data, None
+        except OSError as exc:
+            return other, None, exc
+
+    def record_group(
+        representative: Path, matched_others: list[Path], representative_data: Optional[bytes] = None
+    ) -> None:
         if not matched_others:
             return
-        digest = _full_hash(representative)
+        # `representative_data`, if given, is already the file's full
+        # content (read once for comparison below -- see `is_small`) --
+        # hashing from that instead of `_full_hash` avoids reopening and
+        # rereading the same (already known-small) file a third time.
+        digest = (
+            hashlib.sha256(representative_data).hexdigest()
+            if representative_data is not None
+            else _full_hash(representative)
+        )
         group_paths = [representative] + matched_others
         result.setdefault(digest, []).extend(group_paths)
         if on_checkpoint is not None:
@@ -514,15 +551,35 @@ def _group_by_content(
             # of `workers` -- an unknown size (bucket_size is None) always
             # uses the pool, same as before this was size-aware.
             use_pool = pool is not None and (bucket_size is None or bucket_size >= PARALLEL_IO_THRESHOLD)
+            # Independent of `use_pool` (which also depends on `workers`):
+            # whether this bucket's members are small enough to read fully
+            # into memory once, rather than in the chunked/early-exit style
+            # `files_equal` uses for a file that could be arbitrarily large.
+            # `bucket_size is None` (unknown) is treated as "not small" --
+            # same conservative default `use_pool` already applies above.
+            is_small = bucket_size is not None and bucket_size < PARALLEL_IO_THRESHOLD
             remaining = list(bucket)
             while len(remaining) >= 2:
                 if is_cancelled():
                     cancelled = True
                     break
                 representative, *rest = remaining
+                representative_data: Optional[bytes] = None
                 try:
-                    with representative.open("rb"):
-                        pass
+                    if is_small:
+                        # A bucket's every member shares both size and
+                        # partial hash, so within a single round every
+                        # comparison is against this exact representative
+                        # -- reading it once here and comparing in memory
+                        # (see compare_cached) instead of reopening it once
+                        # per other member (plus again for the final hash
+                        # below) is what previously made the representative
+                        # of a large duplicate-heavy bucket the single
+                        # biggest source of redundant file opens in stage 3.
+                        representative_data = representative.read_bytes()
+                    else:
+                        with representative.open("rb"):
+                            pass
                 except OSError as exc:
                     logger.debug("Skipping unreadable file %s: %s", representative, exc)
                     skipped.append(representative)
@@ -533,11 +590,12 @@ def _group_by_content(
                 mark_done(representative)
                 leftover: list[Path] = []
                 matched_others: list[Path] = []
-                comparisons = (
-                    pool.map(lambda p: compare(representative, p), rest)
-                    if use_pool
-                    else (compare(representative, p) for p in rest)
-                )
+                if use_pool:
+                    comparisons = pool.map(lambda p: compare(representative, p), rest)
+                elif representative_data is not None:
+                    comparisons = (compare_cached(representative_data, p) for p in rest)
+                else:
+                    comparisons = (compare(representative, p) for p in rest)
                 for other, is_equal, err in comparisons:
                     if err is not None:
                         logger.debug("Skipping unreadable file %s: %s", other, err)
@@ -559,7 +617,7 @@ def _group_by_content(
                         # overwhelm the GUI's cross-thread queue and make it
                         # unresponsive even mid-scan, not just afterward.
                         leftover.append(other)
-                record_group(representative, matched_others)
+                record_group(representative, matched_others, representative_data)
                 remaining = leftover
             if not cancelled and len(remaining) == 1:
                 mark_done(remaining[0])
