@@ -269,8 +269,11 @@ runs from both the GUI and the CLI; a cancelled run with saved progress
 is labeled "Cancelled (resumable)" and selecting it enables "Resume
 Selected", which repopulates the directory list and continues that scan
 -- independently of "Resume Last Run" on the main window, which always
-targets the most recently stopped run. "Export..." / "Import..." use the
-same JSON file as `--export-history` / `--import-history`.
+targets the most recently stopped run. The Export button reads "Export
+Selected..." and backs up just the highlighted run when a row is
+selected, or "Export All..." for the full history otherwise; either way
+it/"Import..." use the same JSON file format as `--export-history` /
+`--import-history`.
 
 ## Releasing prebuilt executables
 
