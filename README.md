@@ -285,11 +285,14 @@ cancelled) enables "Load Selected", which reloads that run's full
 results straight into the main window's results tree -- same top-10
 ranking, filtering, and deletion as a fresh scan -- without scanning
 anything; a run made before this existed, or one brought in via
-"Import...", only has its summary, so loading it says so instead.
-"Export..." / "Import..." use the same JSON file as `--export-history` /
-`--import-history` -- and only ever carry that summary, not the
-loadable detail, so a run round-tripped through export/import loses its
-"Load Selected" data even though it keeps its history-list row.
+"Import...", only has its summary, so loading it says so instead. The
+Export button reads "Export Selected..." and backs up just the
+highlighted run when a row is selected, or "Export All..." for the full
+history otherwise; either way it/"Import..." use the same JSON file
+format as `--export-history` / `--import-history` -- and only ever
+carry that summary, not the loadable detail, so a run round-tripped
+through export/import loses its "Load Selected" data even though it
+keeps its history-list row.
 
 ## Releasing prebuilt executables
 

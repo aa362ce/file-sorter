@@ -66,13 +66,13 @@ class HistoryDialog(QDialog):
         self.load_btn = QPushButton("Load Selected")
         self.load_btn.clicked.connect(self._load_selected)
         self.load_btn.setEnabled(False)
-        export_btn = QPushButton("Export...")
-        export_btn.clicked.connect(self._export)
+        self.export_btn = QPushButton("Export...")
+        self.export_btn.clicked.connect(self._export)
         import_btn = QPushButton("Import...")
         import_btn.clicked.connect(self._import)
         button_row.addWidget(self.resume_btn)
         button_row.addWidget(self.load_btn)
-        button_row.addWidget(export_btn)
+        button_row.addWidget(self.export_btn)
         button_row.addWidget(import_btn)
         button_row.addStretch()
         layout.addLayout(button_row)
@@ -116,15 +116,14 @@ class HistoryDialog(QDialog):
         record = self._records[row]
         return record.cancelled and str(record.timestamp) in self._resumable
 
-    def _selected_record(self, row: int) -> Optional[RunRecord]:
-        if row < 0 or row >= len(self._records):
-            return None
-        return self._records[row]
+    def _selected_record(self) -> Optional[RunRecord]:
+        row = self.table.currentRow()
+        return self._records[row] if 0 <= row < len(self._records) else None
 
     def _update_button_states(self) -> None:
-        row = self.table.currentRow()
-        self.resume_btn.setEnabled(self._is_resumable(row))
-        self.load_btn.setEnabled(self._selected_record(row) is not None)
+        self.resume_btn.setEnabled(self._is_resumable(self.table.currentRow()))
+        self.load_btn.setEnabled(self._selected_record() is not None)
+        self.export_btn.setText("Export Selected..." if self._selected_record() is not None else "Export All...")
 
     def _resume_selected(self) -> None:
         row = self.table.currentRow()
@@ -143,8 +142,7 @@ class HistoryDialog(QDialog):
         self.accept()
 
     def _load_selected(self) -> None:
-        row = self.table.currentRow()
-        record = self._selected_record(row)
+        record = self._selected_record()
         if record is None:
             return
         run_id = str(record.timestamp)
@@ -162,13 +160,18 @@ class HistoryDialog(QDialog):
         self.accept()
 
     def _export(self) -> None:
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export run history", "file-sorter-history.json", "JSON files (*.json)"
+        selected_record = self._selected_record()
+        default_name = (
+            f"file-sorter-run-{datetime.fromtimestamp(selected_record.timestamp).strftime('%Y%m%d-%H%M')}.json"
+            if selected_record is not None
+            else "file-sorter-history.json"
         )
+        path_str, _ = QFileDialog.getSaveFileName(self, "Export run history", default_name, "JSON files (*.json)")
         if not path_str:
             return
+        run_ids = [str(selected_record.timestamp)] if selected_record is not None else None
         try:
-            count = export_history(Path(path_str))
+            count = export_history(Path(path_str), run_ids=run_ids)
         except OSError as exc:
             QMessageBox.warning(self, "Export failed", str(exc))
             return
