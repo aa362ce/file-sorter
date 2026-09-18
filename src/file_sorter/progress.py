@@ -48,6 +48,13 @@ class Progress:
 
     def update(self, n: int = 1) -> None:
         self.count += n
+        if not self.enabled and self.on_progress is None:
+            # Nothing listening -- skip the timer call and both interval
+            # checks below entirely. Cheap on its own, but this runs once
+            # per file, so on a multi-million-file scan with progress
+            # reporting off (e.g. --quiet, or a caller like a benchmark
+            # that passes neither) it adds up to a real, pointless cost.
+            return
         now = time.monotonic()
         if self.enabled and now - self._last_emit >= self.interval:
             self._emit()
