@@ -25,6 +25,23 @@ PARTIAL_CHUNK_SIZE = 8192
 FULL_READ_CHUNK_SIZE = 1024 * 1024
 LARGE_FILE_THRESHOLD = 500 * 1024 * 1024  # 500MB
 
+# Below this many bytes of *actual I/O* a file needs (not necessarily its
+# full size -- see PARTIAL_CHUNK_SIZE below), handing it to a thread pool
+# costs more than it could ever save: each worker thread only holds the
+# GIL released for a few microseconds around one small read, so with
+# several threads all doing that at once, the constant handoff/contention
+# between them dominates over the tiny sliver of real work. Measured
+# directly (see dedupe benchmarks): hashing a million small files one at a
+# time in a single thread was 10-14x *faster* than spreading the same work
+# across a 4-thread pool, including against a cold page cache on real
+# disk -- concurrency only starts winning once each file's read is large
+# enough (roughly hundreds of KB and up in that same measurement) that the
+# GIL is actually released for a meaningful stretch, long enough for
+# threads to genuinely overlap. Below the threshold, `_hash_parallel` and
+# `_group_by_content` process files directly in the calling thread instead
+# of via the pool, regardless of how many `workers` were requested.
+PARALLEL_IO_THRESHOLD = 256 * 1024  # 256KB
+
 # Directories excluded from the walk by default -- matched case-insensitively
 # against a directory's own name (basename), not its full path, so this
 # applies no matter how deep it's nested (e.g. every project's own
@@ -367,14 +384,23 @@ def _group_by_content(
     is_cancelled: Callable[[], bool],
     on_checkpoint: Optional[Callable[[list[tuple[str, Path]], list[Path]], None]] = None,
     on_group_found: Optional[GroupFoundCallback] = None,
+    bucket_sizes: Optional[list[int]] = None,
 ) -> tuple[dict[str, list[Path]], list[Path], list[Path], bool]:
     """Confirm which files within each bucket (files that already share a
     size and a partial hash from earlier stages) are true duplicates, by
     comparing their content directly instead of hashing every one of them.
 
     Within a bucket, one file is picked as the "representative" and every
-    other file in the bucket is compared against it (concurrently, across a
-    thread pool of `workers` threads); matches join its group, non-matches
+    other file in the bucket is compared against it -- concurrently, across
+    a thread pool of `workers` threads, but only for a bucket whose files
+    are large enough for that to help (see `PARALLEL_IO_THRESHOLD`); a
+    bucket of small files is compared directly in this thread instead,
+    since a thread pool's own overhead would otherwise dominate the actual
+    (tiny) amount of work. `bucket_sizes[i]`, if given, is the file size
+    for every member of `buckets[i]` (all members of a bucket share the
+    same size, by construction -- see `find_duplicates`); None (the
+    default, or a bucket whose size isn't known) always uses the pool, the
+    previous unconditional behavior. Matches join its group, non-matches
     are set aside and the same process repeats among them (picking a new
     representative) until none remain -- so a bucket with more than one
     distinct file (a rare partial-hash coincidence) still ends up correctly
@@ -478,10 +504,16 @@ def _group_by_content(
             queue_group(DuplicateGroup(file_hash=digest, size=size, paths=group_paths, confirmed=True))
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    sizes = bucket_sizes if bucket_sizes is not None else [None] * len(buckets)
     try:
-        for bucket in buckets:
+        for bucket, bucket_size in zip(buckets, sizes):
             if cancelled:
                 break
+            # See PARALLEL_IO_THRESHOLD: comparing a bucket of small files
+            # is faster done directly than handed to the pool, regardless
+            # of `workers` -- an unknown size (bucket_size is None) always
+            # uses the pool, same as before this was size-aware.
+            use_pool = pool is not None and (bucket_size is None or bucket_size >= PARALLEL_IO_THRESHOLD)
             remaining = list(bucket)
             while len(remaining) >= 2:
                 if is_cancelled():
@@ -503,7 +535,7 @@ def _group_by_content(
                 matched_others: list[Path] = []
                 comparisons = (
                     pool.map(lambda p: compare(representative, p), rest)
-                    if pool is not None
+                    if use_pool
                     else (compare(representative, p) for p in rest)
                 )
                 for other, is_equal, err in comparisons:
@@ -558,20 +590,26 @@ def _hash_parallel(
     on_progress: Optional[ProgressCallback],
     is_cancelled: Callable[[], bool],
     on_checkpoint: Optional[Callable[[list[tuple[K, Path]], list[Path]], None]] = None,
+    size_of: Optional[Callable[[T], int]] = None,
 ) -> tuple[dict[K, list[Path]], list[Path], list[Path], bool]:
     """Hash `items` into buckets keyed by `key_of`, spreading the reads and
-    hashing across a thread pool of `workers` threads.
+    hashing across a thread pool of `workers` threads -- but only for items
+    whose read is actually large enough for that to help (see
+    `PARALLEL_IO_THRESHOLD`); everything below it is hashed directly in the
+    calling thread regardless of `workers`, since a thread pool's own
+    overhead would otherwise dominate.
 
-    Hashing is a mix of file I/O (which releases the GIL while waiting on
-    the OS) and CPU work in hashlib's C implementation (which also releases
-    the GIL for each chunk), so multiple files can genuinely be read and
-    hashed at the same time instead of one at a time -- `workers` should
-    typically track the number of CPU cores available.
+    `size_of(item)`, if given, returns the number of bytes `hash_fn` will
+    actually read for `item` -- not necessarily the file's full size (e.g.
+    a partial hash that only ever reads a small fixed prefix regardless of
+    how big the file is). None (the default) treats every item as worth
+    parallelizing, the previous unconditional behavior.
 
-    Cancellation is checked once per batch of `workers` files rather than
-    between every single file, since a whole batch is already in flight
+    Cancellation is checked between every item while processing items
+    directly in this thread, and once per batch of `workers` items while
+    dispatched to the thread pool (a whole batch is already in flight
     together by the time it could be checked; whatever a batch finishes is
-    kept before stopping.
+    kept before stopping).
 
     `on_checkpoint(new_entries, new_skipped)`, if given, is called every
     `CHECKPOINT_INTERVAL` files with only what's new since the last call --
@@ -620,33 +658,51 @@ def _hash_parallel(
             progress.update()
         flush_checkpoint()
 
-    if workers <= 1 or total <= 1:
-        for item in items:
-            if is_cancelled():
-                cancelled = True
-                break
-            try:
-                record(item, hash_fn(path_of(item)), None)
-            except OSError as exc:
-                record(item, None, exc)
-        flush_checkpoint(force=True)
-        progress.close()
-        return result, processed, skipped, cancelled
+    def process_one(item: T) -> None:
+        try:
+            record(item, hash_fn(path_of(item)), None)
+        except OSError as exc:
+            record(item, None, exc)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        index = 0
-        while index < total:
-            if is_cancelled():
-                cancelled = True
-                break
-            batch = items[index : index + workers]
-            futures = [(item, pool.submit(hash_fn, path_of(item))) for item in batch]
-            for item, future in futures:
-                try:
-                    record(item, future.result(), None)
-                except OSError as exc:
-                    record(item, None, exc)
-            index += len(batch)
+    if size_of is not None:
+        small_items = [item for item in items if size_of(item) < PARALLEL_IO_THRESHOLD]
+        large_items = [item for item in items if size_of(item) >= PARALLEL_IO_THRESHOLD]
+    else:
+        small_items, large_items = [], items
+
+    # See PARALLEL_IO_THRESHOLD: a thread pool never pays for itself on a
+    # read this small, so these are always processed directly here,
+    # regardless of `workers`.
+    for item in small_items:
+        if is_cancelled():
+            cancelled = True
+            break
+        process_one(item)
+
+    if not cancelled and large_items:
+        if workers <= 1 or len(large_items) <= 1:
+            for item in large_items:
+                if is_cancelled():
+                    cancelled = True
+                    break
+                process_one(item)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                index = 0
+                large_total = len(large_items)
+                while index < large_total:
+                    if is_cancelled():
+                        cancelled = True
+                        break
+                    batch = large_items[index : index + workers]
+                    futures = [(item, pool.submit(hash_fn, path_of(item))) for item in batch]
+                    for item, future in futures:
+                        try:
+                            record(item, future.result(), None)
+                        except OSError as exc:
+                            record(item, None, exc)
+                    index += len(batch)
+
     flush_checkpoint(force=True)
     progress.close()
     return result, processed, skipped, cancelled
@@ -1100,6 +1156,12 @@ def find_duplicates(
             on_progress=on_progress,
             is_cancelled=is_cancelled,
             on_checkpoint=_checkpoint_stage2,
+            # A partial hash only ever reads the first PARTIAL_CHUNK_SIZE
+            # bytes no matter how big the file actually is, so that (not
+            # the file's real size) is what decides whether this file's
+            # hash is worth handing to the thread pool -- see
+            # PARALLEL_IO_THRESHOLD.
+            size_of=lambda item: min(item[0], PARTIAL_CHUNK_SIZE),
         )
         for key, paths in hashed.items():
             by_partial[key].extend(paths)
@@ -1127,6 +1189,7 @@ def find_duplicates(
         # compare now versus very-large-file buckets whose confirmation is
         # deferred until deletion time (see `large_file_threshold` above).
         buckets: list[list[Path]] = []
+        bucket_sizes: list[int] = []
         for (size, partial_digest), paths in by_partial.items():
             if len(paths) < 2:
                 continue
@@ -1161,6 +1224,7 @@ def find_duplicates(
                 )
             else:
                 buckets.append(paths)
+                bucket_sizes.append(size)
 
         if deferred_groups and on_group_found is not None:
             # All already known at this point -- no throttling needed for
@@ -1205,6 +1269,7 @@ def find_duplicates(
             is_cancelled=is_cancelled,
             on_checkpoint=_checkpoint_stage3,
             on_group_found=on_group_found,
+            bucket_sizes=bucket_sizes,
         )
         for key, paths in hashed.items():
             by_full[key].extend(paths)
