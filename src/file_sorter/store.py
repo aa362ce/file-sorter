@@ -524,9 +524,18 @@ def load_history() -> list[RunRecord]:
     return [_row_to_run_record(row) for row in rows]
 
 
-def export_history(path: Path) -> int:
-    """Write the full current history to `path` as JSON. Returns the count written."""
+def export_history(path: Path, run_ids: Optional[Iterable[str]] = None) -> int:
+    """Write history to `path` as JSON. Returns the count written.
+
+    With `run_ids` omitted, writes the full history. Otherwise writes only
+    the records whose `str(timestamp)` (i.e. run id) is in `run_ids`, so a
+    single selected run can be backed up without dragging along the rest
+    of the history.
+    """
     records = load_history()
+    if run_ids is not None:
+        wanted = set(run_ids)
+        records = [r for r in records if str(r.timestamp) in wanted]
     path.write_text(json.dumps([asdict(r) for r in records], indent=2))
     return len(records)
 
