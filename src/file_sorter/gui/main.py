@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -51,7 +50,6 @@ from ..store import (
     save_resume_state,
     save_run_groups,
 )
-from .file_explorer import FileExplorer
 from .history_dialog import HistoryDialog
 from .worker import ScanWorker
 
@@ -89,22 +87,7 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        central_layout = QVBoxLayout(central)
-        central_layout.setContentsMargins(0, 0, 0, 0)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        central_layout.addWidget(splitter)
-
-        self.file_explorer = FileExplorer()
-        self.file_explorer.directory_chosen.connect(self._add_directory_path)
-        splitter.addWidget(self.file_explorer)
-
-        main_panel = QWidget()
-        layout = QVBoxLayout(main_panel)
-        splitter.addWidget(main_panel)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 640])
+        layout = QVBoxLayout(central)
 
         dir_row = QHBoxLayout()
         self.dir_list = QListWidget()
