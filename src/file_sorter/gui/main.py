@@ -188,8 +188,12 @@ class MainWindow(QMainWindow):
         self.delete_btn = QPushButton("Delete Checked (to Trash)")
         self.delete_btn.clicked.connect(self._delete_checked)
         self.delete_btn.setEnabled(False)
+        self.delete_all_btn = QPushButton("Delete All Duplicates (to Trash)")
+        self.delete_all_btn.clicked.connect(self._delete_all_duplicates)
+        self.delete_all_btn.setEnabled(False)
         bottom_row.addWidget(self.reclaimable_label, 1)
         bottom_row.addWidget(self.delete_btn)
+        bottom_row.addWidget(self.delete_all_btn)
         layout.addLayout(bottom_row)
 
     # -- directory list -----------------------------------------------
@@ -221,6 +225,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(True)
         self.resume_btn.setEnabled(False)
         self.delete_btn.setEnabled(False)
+        self.delete_all_btn.setEnabled(False)
         self.results_tree.clear()
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Resuming scan..." if resume_state else "Scanning...")
@@ -298,6 +303,7 @@ class MainWindow(QMainWindow):
             checkbox.setEnabled(True)
         self._render_results()
         self.delete_btn.setEnabled(bool(groups or folder_groups))
+        self.delete_all_btn.setEnabled(bool(groups or folder_groups))
 
     def _cancel_scan(self) -> None:
         if self._worker is not None:
@@ -387,6 +393,7 @@ class MainWindow(QMainWindow):
             checkbox.setEnabled(True)
         self._render_results()
         self.delete_btn.setEnabled(bool(result.groups))
+        self.delete_all_btn.setEnabled(bool(result.groups))
         self._worker = None
 
     def _render_results(self) -> None:
@@ -718,6 +725,156 @@ class MainWindow(QMainWindow):
             self._remove_item(item)
 
         self._update_reclaimable_label()
+        if failures:
+            QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
+
+    def _delete_all_duplicates(self) -> None:
+        """Deletes every duplicate this scan found, not just the
+        `TOP_RESULTS_LIMIT` groups the tree currently renders (see
+        `_render_results`) -- equivalent to checking every checkable box
+        at its default state (first copy kept, the rest checked) across
+        the *entire* result and then running `_delete_checked`, just
+        computed directly from `self._last_result` instead of the tree's
+        checkbox state so it isn't limited by what's actually on screen.
+        Same safety guards apply: a file covered by a confirmed folder
+        match is left to that folder's own deletion, a copy is never
+        deleted if it would be the last surviving one, and a deferred
+        (very-large-file) group is verified against its kept copy right
+        before deletion.
+        """
+        result = self._last_result
+        if result is None:
+            return
+
+        confirmed_folder_groups = [fg for fg in result.folder_groups if fg.confirmed]
+        confirmed_folder_dirs = [d for fg in confirmed_folder_groups for d in fg.paths]
+        # Only the copies actually being deleted -- unlike
+        # confirmed_folder_dirs above (every confirmed folder copy, used
+        # to decide whether a *file* is covered), this is what a file's
+        # own path is checked against to see whether its containing
+        # folder is being removed out from under it.
+        delete_dirs = [path for fg in confirmed_folder_groups for path in fg.paths[1:]]
+
+        def covered(path: Path) -> bool:
+            return any(path.is_relative_to(d) for d in confirmed_folder_dirs)
+
+        def under_any(path: Path, roots: list[Path]) -> bool:
+            return any(path.is_relative_to(root) for root in roots)
+
+        # (group, kept path, [copies to delete]) for every file-level
+        # group with at least one deletable copy once folder-covered
+        # paths are set aside -- mirrors _build_group_item's own "first
+        # uncovered copy stays kept, the rest checked" default.
+        file_plans: list[tuple[DuplicateGroup, Path, list[Path]]] = []
+        for group in result.groups:
+            uncovered = [p for p in group.paths if not covered(p)]
+            if len(uncovered) < 2:
+                # Either every copy is covered by a confirmed folder match
+                # (handled entirely at the folder level) or there's
+                # nothing left to delete once covered copies are set aside.
+                continue
+            kept, *targets = uncovered
+            file_plans.append((group, kept, targets))
+
+        total_folders = sum(len(fg.paths) - 1 for fg in confirmed_folder_groups)
+        total_files = sum(len(targets) for _group, _kept, targets in file_plans)
+        if total_folders == 0 and total_files == 0:
+            QMessageBox.information(self, "Nothing to delete", "No duplicate copies to delete.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm deletion",
+            f"Delete ALL duplicates found -- {total_folders} folder(s) and {total_files} file(s), "
+            "keeping one copy of each. Move them all to Trash?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        failures: list[str] = []
+        deleted_dirs: set[Path] = set()
+        for fg in confirmed_folder_groups:
+            for path in fg.paths[1:]:
+                try:
+                    send2trash(str(path))
+                except OSError as exc:
+                    failures.append(f"{path}: {exc}")
+                    continue
+                deleted_dirs.add(path)
+
+        # Every copy any group plans to delete, used the same way
+        # `_delete_checked` uses `checked_file_paths`: a copy could be the
+        # last surviving member of its group once every other planned
+        # deletion (folder- and file-level alike) is actually applied.
+        planned_deletions = {target for _group, _kept, targets in file_plans for target in targets}
+
+        def has_survivor(group: DuplicateGroup, path: Path, kept: Path) -> bool:
+            return any(
+                p != path and not under_any(p, delete_dirs) and (p == kept or p not in planned_deletions)
+                for p in group.paths
+            )
+
+        remaining_groups: list[DuplicateGroup] = []
+        for group, kept, targets in file_plans:
+            surviving = list(group.paths)
+            for path in targets:
+                if under_any(path, delete_dirs):
+                    # Already handled by a folder-level deletion above --
+                    # same as _delete_checked, a folder-level failure is
+                    # reported once for the folder itself above, not
+                    # repeated per file underneath it.
+                    surviving.remove(path)
+                    continue
+                if not has_survivor(group, path, kept):
+                    failures.append(
+                        f"{path}: deleting it would remove the last remaining copy of this file -- skipped"
+                    )
+                    continue
+                if not group.confirmed:
+                    # Confirmation of this group was deferred during the
+                    # scan (a very large file) -- do it now, against the
+                    # kept copy, before actually deleting anything.
+                    try:
+                        verified = files_equal(kept, path)
+                    except OSError:
+                        verified = False
+                    if not verified:
+                        failures.append(
+                            f"{path}: not verified as an actual duplicate of the kept file -- "
+                            "skipped rather than risk deleting a non-duplicate"
+                        )
+                        continue
+                try:
+                    send2trash(str(path))
+                except OSError as exc:
+                    failures.append(f"{path}: {exc}")
+                    continue
+                surviving.remove(path)
+            if len(surviving) > 1:
+                remaining_groups.append(
+                    DuplicateGroup(file_hash=group.file_hash, size=group.size, paths=surviving, confirmed=group.confirmed)
+                )
+
+        remaining_folder_groups = [fg for fg in result.folder_groups if fg not in confirmed_folder_groups] + [
+            FolderGroup(paths=surviving, file_count=fg.file_count, size=fg.size, confirmed=fg.confirmed)
+            for fg in confirmed_folder_groups
+            for surviving in [[p for p in fg.paths if p not in deleted_dirs]]
+            if len(surviving) > 1
+        ]
+
+        self._last_result = ScanResult(
+            groups=remaining_groups,
+            skipped=result.skipped,
+            cancelled=result.cancelled,
+            resume_state=result.resume_state,
+            folder_groups=remaining_folder_groups,
+            reused_run_id=result.reused_run_id,
+        )
+        self._render_results()
+        has_remaining = bool(remaining_groups or remaining_folder_groups)
+        self.delete_btn.setEnabled(has_remaining)
+        self.delete_all_btn.setEnabled(has_remaining)
         if failures:
             QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
 
