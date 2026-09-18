@@ -181,6 +181,24 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             path TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_resume_progress_run ON resume_progress(run_id);
+        CREATE TABLE IF NOT EXISTS run_groups (
+            run_id TEXT NOT NULL,
+            group_idx INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            file_hash TEXT,
+            file_count INTEGER,
+            size INTEGER NOT NULL,
+            confirmed INTEGER NOT NULL,
+            PRIMARY KEY (run_id, kind, group_idx)
+        );
+        CREATE TABLE IF NOT EXISTS run_group_paths (
+            run_id TEXT NOT NULL,
+            group_idx INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            path TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_group_paths_run ON run_group_paths(run_id);
         """
     )
     conn.commit()
@@ -458,14 +476,16 @@ def _upsert_run(conn: sqlite3.Connection, run_id: str, record: RunRecord) -> Non
     )
     row = conn.execute("SELECT COUNT(*) FROM runs").fetchone()
     if row[0] > MAX_HISTORY_ENTRIES:
-        conn.execute(
-            """
-            DELETE FROM runs WHERE run_id IN (
-                SELECT run_id FROM runs ORDER BY timestamp ASC LIMIT ?
-            )
-            """,
-            (row[0] - MAX_HISTORY_ENTRIES,),
-        )
+        stale_ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT run_id FROM runs ORDER BY timestamp ASC LIMIT ?",
+                (row[0] - MAX_HISTORY_ENTRIES,),
+            ).fetchall()
+        ]
+        conn.executemany("DELETE FROM runs WHERE run_id = ?", [(rid,) for rid in stale_ids])
+        conn.executemany("DELETE FROM run_groups WHERE run_id = ?", [(rid,) for rid in stale_ids])
+        conn.executemany("DELETE FROM run_group_paths WHERE run_id = ?", [(rid,) for rid in stale_ids])
 
 
 def _row_to_run_record(row: sqlite3.Row) -> RunRecord:
@@ -512,6 +532,87 @@ def record_run(
         _upsert_run(conn, run_id if run_id is not None else str(timestamp), record)
     conn.close()
     return record
+
+
+def save_run_groups(run_id: str, result: "ScanResult") -> None:
+    """Persist the full duplicate groups/folder groups of a finished (or
+    cancelled) run, so `load_run_groups` can later reload the same result
+    for display without re-scanning. Companion to `record_run`, which only
+    stores the summary shown in history -- callers save both for the same
+    run_id.
+    """
+    group_rows = []
+    path_rows = []
+    for idx, group in enumerate(result.groups):
+        group_rows.append((run_id, idx, "file", group.file_hash, None, group.size, int(group.confirmed)))
+        path_rows.extend((run_id, idx, "file", seq, str(path)) for seq, path in enumerate(group.paths))
+    for idx, folder_group in enumerate(result.folder_groups):
+        group_rows.append(
+            (run_id, idx, "folder", None, folder_group.file_count, folder_group.size, int(folder_group.confirmed))
+        )
+        path_rows.extend(
+            (run_id, idx, "folder", seq, str(path)) for seq, path in enumerate(folder_group.paths)
+        )
+
+    conn = _connect()
+    with conn:
+        conn.execute("DELETE FROM run_groups WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM run_group_paths WHERE run_id = ?", (run_id,))
+        if group_rows:
+            conn.executemany(
+                "INSERT INTO run_groups (run_id, group_idx, kind, file_hash, file_count, size, confirmed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                group_rows,
+            )
+        if path_rows:
+            conn.executemany(
+                "INSERT INTO run_group_paths (run_id, group_idx, kind, seq, path) VALUES (?, ?, ?, ?, ?)",
+                path_rows,
+            )
+    conn.close()
+
+
+def load_run_groups(run_id: str) -> Optional[tuple[list, list]]:
+    """Reload the duplicate groups/folder groups saved by `save_run_groups`
+    for `run_id`, as (groups, folder_groups) -- or None if nothing was
+    saved for it (e.g. a run from before this existed, or one imported
+    from a history export, which only ever carries the summary).
+    """
+    from .dedupe import DuplicateGroup
+    from .folders import FolderGroup
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        group_rows = conn.execute(
+            "SELECT * FROM run_groups WHERE run_id = ? ORDER BY kind, group_idx", (run_id,)
+        ).fetchall()
+        if not group_rows:
+            return None
+        path_rows = conn.execute(
+            "SELECT group_idx, kind, path FROM run_group_paths WHERE run_id = ? ORDER BY kind, group_idx, seq",
+            (run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    paths_by_key: dict[tuple[str, int], list[Path]] = defaultdict(list)
+    for row in path_rows:
+        paths_by_key[(row["kind"], row["group_idx"])].append(Path(row["path"]))
+
+    groups: list[DuplicateGroup] = []
+    folder_groups: list[FolderGroup] = []
+    for row in group_rows:
+        paths = paths_by_key.get((row["kind"], row["group_idx"]), [])
+        if row["kind"] == "file":
+            groups.append(
+                DuplicateGroup(file_hash=row["file_hash"], size=row["size"], paths=paths, confirmed=bool(row["confirmed"]))
+            )
+        else:
+            folder_groups.append(
+                FolderGroup(paths=paths, file_count=row["file_count"], size=row["size"], confirmed=bool(row["confirmed"]))
+            )
+    return groups, folder_groups
 
 
 def load_history() -> list[RunRecord]:

@@ -203,6 +203,17 @@ file-sorter --export-history backup.json
 file-sorter --import-history backup.json
 ```
 
+Reload and print a past run's full results, using the # index `--history`
+shows, without re-scanning anything:
+
+```bash
+file-sorter --show 3
+```
+
+Only available for a run made after this option was added -- an older run,
+or one merged in from `--import-history`, kept only its summary, and
+`--show` says so rather than re-scanning.
+
 ## GUI
 
 A PySide6 desktop app is available as an optional extra:
@@ -269,8 +280,16 @@ runs from both the GUI and the CLI; a cancelled run with saved progress
 is labeled "Cancelled (resumable)" and selecting it enables "Resume
 Selected", which repopulates the directory list and continues that scan
 -- independently of "Resume Last Run" on the main window, which always
-targets the most recently stopped run. "Export..." / "Import..." use the
-same JSON file as `--export-history` / `--import-history`.
+targets the most recently stopped run. Selecting any run (done or
+cancelled) enables "Load Selected", which reloads that run's full
+results straight into the main window's results tree -- same top-10
+ranking, filtering, and deletion as a fresh scan -- without scanning
+anything; a run made before this existed, or one brought in via
+"Import...", only has its summary, so loading it says so instead.
+"Export..." / "Import..." use the same JSON file as `--export-history` /
+`--import-history` -- and only ever carry that summary, not the
+loadable detail, so a run round-tripped through export/import loses its
+"Load Selected" data even though it keeps its history-list row.
 
 ## Releasing prebuilt executables
 

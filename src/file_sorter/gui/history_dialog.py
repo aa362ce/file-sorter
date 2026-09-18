@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -17,7 +18,15 @@ from PySide6.QtWidgets import (
 )
 
 from ..formatting import human_size
-from ..store import RunRecord, export_history, import_history, load_history, load_resume_state, resumable_run_ids
+from ..store import (
+    RunRecord,
+    export_history,
+    import_history,
+    load_history,
+    load_resume_state,
+    load_run_groups,
+    resumable_run_ids,
+)
 
 
 class HistoryDialog(QDialog):
@@ -25,6 +34,11 @@ class HistoryDialog(QDialog):
     # clicks "Resume Selected" -- the main window does the actual resuming,
     # since it owns the directory list and the scan worker.
     resume_requested = Signal(str, object)
+    # Emits (RunRecord, groups, folder_groups) when the user picks a run
+    # with saved detailed results and clicks "Load Selected" -- the main
+    # window renders them into the results tree, same as a fresh scan's
+    # result, without re-scanning anything.
+    load_requested = Signal(object, object, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -42,18 +56,22 @@ class HistoryDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.itemSelectionChanged.connect(self._update_resume_button)
+        self.table.itemSelectionChanged.connect(self._update_button_states)
         layout.addWidget(self.table)
 
         button_row = QHBoxLayout()
         self.resume_btn = QPushButton("Resume Selected")
         self.resume_btn.clicked.connect(self._resume_selected)
         self.resume_btn.setEnabled(False)
+        self.load_btn = QPushButton("Load Selected")
+        self.load_btn.clicked.connect(self._load_selected)
+        self.load_btn.setEnabled(False)
         export_btn = QPushButton("Export...")
         export_btn.clicked.connect(self._export)
         import_btn = QPushButton("Import...")
         import_btn.clicked.connect(self._import)
         button_row.addWidget(self.resume_btn)
+        button_row.addWidget(self.load_btn)
         button_row.addWidget(export_btn)
         button_row.addWidget(import_btn)
         button_row.addStretch()
@@ -72,7 +90,7 @@ class HistoryDialog(QDialog):
             table.setRowCount(1)
             table.setSpan(0, 0, 1, 6)
             table.setItem(0, 0, QTableWidgetItem("No run history yet."))
-            self._update_resume_button()
+            self._update_button_states()
             return
 
         table.setRowCount(len(records))
@@ -90,7 +108,7 @@ class HistoryDialog(QDialog):
             table.setItem(row, 3, QTableWidgetItem(str(record.groups)))
             table.setItem(row, 4, QTableWidgetItem(human_size(record.reclaimable_bytes)))
             table.setItem(row, 5, QTableWidgetItem(f"{record.duration_seconds:.1f}s"))
-        self._update_resume_button()
+        self._update_button_states()
 
     def _is_resumable(self, row: int) -> bool:
         if row < 0 or row >= len(self._records):
@@ -98,8 +116,15 @@ class HistoryDialog(QDialog):
         record = self._records[row]
         return record.cancelled and str(record.timestamp) in self._resumable
 
-    def _update_resume_button(self) -> None:
-        self.resume_btn.setEnabled(self._is_resumable(self.table.currentRow()))
+    def _selected_record(self, row: int) -> Optional[RunRecord]:
+        if row < 0 or row >= len(self._records):
+            return None
+        return self._records[row]
+
+    def _update_button_states(self) -> None:
+        row = self.table.currentRow()
+        self.resume_btn.setEnabled(self._is_resumable(row))
+        self.load_btn.setEnabled(self._selected_record(row) is not None)
 
     def _resume_selected(self) -> None:
         row = self.table.currentRow()
@@ -115,6 +140,25 @@ class HistoryDialog(QDialog):
             self._reload()
             return
         self.resume_requested.emit(run_id, resume_state)
+        self.accept()
+
+    def _load_selected(self) -> None:
+        row = self.table.currentRow()
+        record = self._selected_record(row)
+        if record is None:
+            return
+        run_id = str(record.timestamp)
+        loaded = load_run_groups(run_id)
+        if loaded is None:
+            QMessageBox.information(
+                self,
+                "Nothing to load",
+                "This run has no saved detailed results (only its summary is kept) -- "
+                "it may predate this feature, or have been imported from a history export.",
+            )
+            return
+        groups, folder_groups = loaded
+        self.load_requested.emit(record, groups, folder_groups)
         self.accept()
 
     def _export(self) -> None:
