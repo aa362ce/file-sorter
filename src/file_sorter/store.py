@@ -199,6 +199,19 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             path TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_run_group_paths_run ON run_group_paths(run_id);
+        CREATE TABLE IF NOT EXISTS scan_manifests (
+            dir_key TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            saved_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scan_manifest_files (
+            dir_key TEXT NOT NULL,
+            path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime REAL NOT NULL,
+            PRIMARY KEY (dir_key, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_manifest_files_dir ON scan_manifest_files(dir_key);
         """
     )
     conn.commit()
@@ -486,6 +499,7 @@ def _upsert_run(conn: sqlite3.Connection, run_id: str, record: RunRecord) -> Non
         conn.executemany("DELETE FROM runs WHERE run_id = ?", [(rid,) for rid in stale_ids])
         conn.executemany("DELETE FROM run_groups WHERE run_id = ?", [(rid,) for rid in stale_ids])
         conn.executemany("DELETE FROM run_group_paths WHERE run_id = ?", [(rid,) for rid in stale_ids])
+        _delete_manifests_for_runs(conn, stale_ids)
 
 
 def _row_to_run_record(row: sqlite3.Row) -> RunRecord:
@@ -673,3 +687,139 @@ def import_history(path: Path) -> int:
             added += 1
     conn.close()
     return added
+
+
+def delete_runs(run_ids: Iterable[str]) -> int:
+    """Permanently remove the given run_ids from history, along with any
+    saved detailed results and resume state for them. Returns the count of
+    history entries actually removed.
+    """
+    ids = list(dict.fromkeys(run_ids))
+    if not ids:
+        return 0
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" * len(ids))
+        existing = conn.execute(f"SELECT COUNT(*) FROM runs WHERE run_id IN ({placeholders})", ids).fetchone()[0]
+        with conn:
+            conn.executemany("DELETE FROM runs WHERE run_id = ?", [(rid,) for rid in ids])
+            conn.executemany("DELETE FROM run_groups WHERE run_id = ?", [(rid,) for rid in ids])
+            conn.executemany("DELETE FROM run_group_paths WHERE run_id = ?", [(rid,) for rid in ids])
+            conn.executemany("DELETE FROM resume_runs WHERE run_id = ?", [(rid,) for rid in ids])
+            conn.executemany("DELETE FROM resume_progress WHERE run_id = ?", [(rid,) for rid in ids])
+            _delete_manifests_for_runs(conn, ids)
+    finally:
+        conn.close()
+    return existing
+
+
+def clear_history() -> int:
+    """Remove all run history, saved detailed results, and resume state.
+    Returns the count of history entries removed.
+    """
+    conn = _connect()
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        with conn:
+            conn.execute("DELETE FROM runs")
+            conn.execute("DELETE FROM run_groups")
+            conn.execute("DELETE FROM run_group_paths")
+            conn.execute("DELETE FROM resume_runs")
+            conn.execute("DELETE FROM resume_progress")
+            conn.execute("DELETE FROM scan_manifests")
+            conn.execute("DELETE FROM scan_manifest_files")
+    finally:
+        conn.close()
+    return count
+
+
+# -- scan manifests -------------------------------------------------------
+#
+# A manifest is a {path: (size, mtime)} snapshot of every file under one
+# particular set of scanned directories, saved by `dedupe.scan_or_reuse`
+# after a completed scan. The *next* scan of that same directory set can
+# be checked against it cheaply (a stat-only walk, no hashing) -- if
+# nothing differs, that earlier scan's saved duplicate groups are replayed
+# instead of redoing all the hashing. Keyed by `dir_key` (the directory
+# set, order-independent) rather than by run_id, so each directory set
+# only ever has one manifest -- the most recent -- rather than one per
+# run piling up forever.
+
+
+def _dir_key(directories: Iterable[str]) -> str:
+    return json.dumps(sorted(str(d) for d in directories))
+
+
+def _delete_manifests_for_runs(conn: sqlite3.Connection, run_ids: list[str]) -> None:
+    """Remove any manifest whose `run_id` is one of these -- called when
+    those runs themselves are being deleted (individually or via history
+    eviction), so a manifest never points at a run_id whose saved groups
+    no longer exist. Must be called inside the same transaction as the
+    run deletion it accompanies.
+    """
+    if not run_ids:
+        return
+    placeholders = ",".join("?" * len(run_ids))
+    stale_dir_keys = [
+        row[0] for row in conn.execute(f"SELECT dir_key FROM scan_manifests WHERE run_id IN ({placeholders})", run_ids).fetchall()
+    ]
+    conn.executemany("DELETE FROM scan_manifests WHERE run_id = ?", [(rid,) for rid in run_ids])
+    conn.executemany("DELETE FROM scan_manifest_files WHERE dir_key = ?", [(k,) for k in stale_dir_keys])
+
+
+def save_scan_manifest(directories: Iterable[str], run_id: str, manifest: dict[str, tuple[int, float]]) -> None:
+    """Replace whatever manifest was saved for this directory set (if any)
+    with `manifest`, attributed to `run_id`. See `find_reusable_run` for
+    how it's later checked against.
+    """
+    dir_key = _dir_key(directories)
+    conn = _connect()
+    with conn:
+        conn.execute("DELETE FROM scan_manifest_files WHERE dir_key = ?", (dir_key,))
+        conn.execute(
+            """
+            INSERT INTO scan_manifests (dir_key, run_id, saved_at) VALUES (?, ?, ?)
+            ON CONFLICT(dir_key) DO UPDATE SET run_id=excluded.run_id, saved_at=excluded.saved_at
+            """,
+            (dir_key, run_id, time.time()),
+        )
+        if manifest:
+            conn.executemany(
+                "INSERT INTO scan_manifest_files (dir_key, path, size, mtime) VALUES (?, ?, ?, ?)",
+                [(dir_key, path, size, mtime) for path, (size, mtime) in manifest.items()],
+            )
+    conn.close()
+
+
+def find_reusable_run(directories: Iterable[str], manifest: dict[str, tuple[int, float]]) -> Optional[str]:
+    """If `manifest` (a fresh `{path: (size, mtime)}` snapshot -- see
+    `dedupe.quick_scan_manifest`) exactly matches what was saved for this
+    same directory set by a previous scan -- same files present, same
+    sizes, same modification times, nothing added or removed -- returns
+    that scan's run_id, so its saved duplicate groups (see
+    `load_run_groups`) can be reused instead of rehashing everything.
+
+    Returns None on any mismatch, including when no manifest was ever
+    saved for this directory set -- either way the caller should fall
+    back to a real scan.
+    """
+    dir_key = _dir_key(directories)
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        meta = conn.execute("SELECT run_id FROM scan_manifests WHERE dir_key = ?", (dir_key,)).fetchone()
+        if meta is None:
+            return None
+        rows = conn.execute(
+            "SELECT path, size, mtime FROM scan_manifest_files WHERE dir_key = ?", (dir_key,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if len(rows) != len(manifest):
+        return None
+    for row in rows:
+        current = manifest.get(row["path"])
+        if current is None or current[0] != row["size"] or current[1] != row["mtime"]:
+            return None
+    return meta["run_id"]

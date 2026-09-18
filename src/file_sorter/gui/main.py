@@ -377,7 +377,12 @@ class MainWindow(QMainWindow):
         self.resume_btn.setEnabled(latest_resume_run_id() is not None)
 
         self._last_result = result
-        self._last_result_cancelled_note = " (cancelled -- partial results)" if result.cancelled else ""
+        if result.cancelled:
+            self._last_result_cancelled_note = " (cancelled -- partial results)"
+        elif result.reused_run_id is not None:
+            self._last_result_cancelled_note = " (nothing changed since the last scan -- reused those results)"
+        else:
+            self._last_result_cancelled_note = ""
         for checkbox in self._type_filter_checkboxes.values():
             checkbox.setEnabled(True)
         self._render_results()
