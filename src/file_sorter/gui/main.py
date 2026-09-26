@@ -4,7 +4,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from send2trash import send2trash
 
 from ..dedupe import (
     DEFAULT_EXCLUDED_DIR_NAMES,
@@ -36,7 +35,6 @@ from ..dedupe import (
     DuplicateGroup,
     ScanResult,
     file_matches_types,
-    files_equal,
 )
 from ..folders import FolderGroup
 from ..formatting import human_size
@@ -51,7 +49,7 @@ from ..store import (
     save_run_groups,
 )
 from .history_dialog import HistoryDialog
-from .worker import ScanWorker
+from .worker import DeleteOperation, DeleteOutcome, DeleteWorker, ScanWorker
 
 ICON_PATH = Path(__file__).resolve().parent / "resources" / "icon.png"
 
@@ -69,6 +67,7 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon(str(ICON_PATH)))
 
         self._worker: Optional[ScanWorker] = None
+        self._delete_worker: Optional[DeleteWorker] = None
         self._updating_check = False
         self._scan_directories: list[Path] = []
         self._scan_start: Optional[float] = None
@@ -606,6 +605,51 @@ class MainWindow(QMainWindow):
             index = self.results_tree.indexOfTopLevelItem(parent)
             self.results_tree.takeTopLevelItem(index)
 
+    def _run_delete_operations(
+        self, operations: list[DeleteOperation], on_finished: Callable[[list[DeleteOutcome]], None]
+    ) -> None:
+        """Runs `operations` (moves to Trash) on a `DeleteWorker` off the
+        UI thread, driving the same progress bar/status label the scan
+        uses (see `_on_progress`) so a large delete/move batch gives the
+        same live feedback a scan does instead of freezing the window
+        until it's done. `on_finished` does the actual tree/result
+        bookkeeping once every operation has completed -- see the two
+        callers, `_delete_checked` and `_delete_all_duplicates`.
+        """
+        if not operations:
+            on_finished([])
+            return
+
+        self.scan_btn.setEnabled(False)
+        self.delete_btn.setEnabled(False)
+        self.delete_all_btn.setEnabled(False)
+        self.progress_bar.setRange(0, len(operations))
+        self.progress_bar.setValue(0)
+        self.status_label.setText(f"Deleting: 0/{len(operations)}")
+
+        self._delete_worker = DeleteWorker(operations)
+        self._delete_worker.progress.connect(self._on_delete_progress)
+        self._delete_worker.finished_delete.connect(lambda outcomes: self._on_delete_finished(outcomes, on_finished))
+        self._delete_worker.start()
+
+    def _on_delete_progress(self, done: int, total: int) -> None:
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
+        self.status_label.setText(f"Deleting: {done}/{total}")
+
+    def _on_delete_finished(
+        self, outcomes: list[DeleteOutcome], on_finished: Callable[[list[DeleteOutcome]], None]
+    ) -> None:
+        self.scan_btn.setEnabled(True)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.status_label.setText("Delete complete")
+        self._delete_worker = None
+        # Re-enables delete_btn/delete_all_btn according to what's left,
+        # and does the actual tree/result bookkeeping -- see the two
+        # callers of `_run_delete_operations`.
+        on_finished(outcomes)
+
     def _delete_checked(self) -> None:
         checked = self._checked_items()
         if not checked:
@@ -653,63 +697,55 @@ class MainWindow(QMainWindow):
                 p != path and not under_any(p, delete_dirs) and p not in checked_file_paths for p in group.paths
             )
 
-        failures = []
+        operations: list[DeleteOperation] = []
 
         for item in folder_items:
             path, _size = item.data(0, Qt.ItemDataRole.UserRole)
-            try:
-                send2trash(str(path))
-            except OSError as exc:
-                failures.append(f"{path}: {exc}")
-                continue
-            self._remove_item(item)
+            operations.append(DeleteOperation(kind="folder", path=path, item=item))
 
         for item in file_items:
             path, _size = item.data(0, Qt.ItemDataRole.UserRole)
             if under_any(path, delete_dirs):
                 # Already handled by a folder-level deletion above.
-                self._remove_item(item)
+                operations.append(DeleteOperation(kind="file", path=path, item=item, already_handled=True))
                 continue
 
             group_item = item.parent()
             group: DuplicateGroup = group_item.data(0, Qt.ItemDataRole.UserRole)
 
             if not has_survivor(group, path):
-                failures.append(
-                    f"{path}: deleting it would remove the last remaining copy of this file -- skipped"
+                operations.append(
+                    DeleteOperation(
+                        kind="file",
+                        path=path,
+                        item=item,
+                        skip_reason="deleting it would remove the last remaining copy of this file -- skipped",
+                    )
                 )
                 continue
 
-            if not group.confirmed:
-                # Confirmation of this group was deferred during the scan
-                # (a very large file) -- do it now, against whichever
-                # file(s) in the group are being kept, before actually
-                # deleting anything.
-                verified = False
-                for reference in self._kept_paths(group_item):
-                    try:
-                        if files_equal(reference, path):
-                            verified = True
-                            break
-                    except OSError:
-                        continue
-                if not verified:
-                    failures.append(
-                        f"{path}: not verified as an actual duplicate of the kept file(s) -- "
-                        "skipped rather than risk deleting a non-duplicate"
-                    )
-                    continue
+            # Verification of an unconfirmed group (deferred during the
+            # scan for a very large file) happens on the worker thread --
+            # see DeleteWorker._execute -- against whichever file(s) in
+            # the group are currently unchecked (kept) here.
+            kept_refs = self._kept_paths(group_item) if not group.confirmed else []
+            operations.append(
+                DeleteOperation(kind="file", path=path, item=item, group=group, kept_refs=kept_refs)
+            )
 
-            try:
-                send2trash(str(path))
-            except OSError as exc:
-                failures.append(f"{path}: {exc}")
-                continue
-            self._remove_item(item)
+        def on_finished(outcomes: list[DeleteOutcome]) -> None:
+            failures = [outcome.message for outcome in outcomes if not outcome.ok]
+            for outcome in outcomes:
+                if outcome.ok:
+                    self._remove_item(outcome.op.item)
+            self._update_reclaimable_label()
+            has_remaining = self.results_tree.topLevelItemCount() > 0
+            self.delete_btn.setEnabled(has_remaining)
+            self.delete_all_btn.setEnabled(has_remaining)
+            if failures:
+                QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
 
-        self._update_reclaimable_label()
-        if failures:
-            QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
+        self._run_delete_operations(operations, on_finished)
 
     def _delete_all_duplicates(self) -> None:
         """Deletes every duplicate this scan found, not just the
@@ -775,17 +811,6 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
-        failures: list[str] = []
-        deleted_dirs: set[Path] = set()
-        for fg in confirmed_folder_groups:
-            for path in fg.paths[1:]:
-                try:
-                    send2trash(str(path))
-                except OSError as exc:
-                    failures.append(f"{path}: {exc}")
-                    continue
-                deleted_dirs.add(path)
-
         # Every copy any group plans to delete, used the same way
         # `_delete_checked` uses `checked_file_paths`: a copy could be the
         # last surviving member of its group once every other planned
@@ -798,68 +823,92 @@ class MainWindow(QMainWindow):
                 for p in group.paths
             )
 
-        remaining_groups: list[DuplicateGroup] = []
+        operations: list[DeleteOperation] = []
+        folder_plan: list[tuple[FolderGroup, Path]] = []
+        for fg in confirmed_folder_groups:
+            for path in fg.paths[1:]:
+                operations.append(DeleteOperation(kind="folder", path=path, item=None))
+                folder_plan.append((fg, path))
+
+        file_plan: list[tuple[DuplicateGroup, Path]] = []
         for group, kept, targets in file_plans:
-            surviving = list(group.paths)
             for path in targets:
                 if under_any(path, delete_dirs):
                     # Already handled by a folder-level deletion above --
                     # same as _delete_checked, a folder-level failure is
                     # reported once for the folder itself above, not
                     # repeated per file underneath it.
-                    surviving.remove(path)
-                    continue
-                if not has_survivor(group, path, kept):
-                    failures.append(
-                        f"{path}: deleting it would remove the last remaining copy of this file -- skipped"
-                    )
-                    continue
-                if not group.confirmed:
-                    # Confirmation of this group was deferred during the
-                    # scan (a very large file) -- do it now, against the
-                    # kept copy, before actually deleting anything.
-                    try:
-                        verified = files_equal(kept, path)
-                    except OSError:
-                        verified = False
-                    if not verified:
-                        failures.append(
-                            f"{path}: not verified as an actual duplicate of the kept file -- "
-                            "skipped rather than risk deleting a non-duplicate"
+                    operations.append(DeleteOperation(kind="file", path=path, item=None, already_handled=True))
+                elif not has_survivor(group, path, kept):
+                    operations.append(
+                        DeleteOperation(
+                            kind="file",
+                            path=path,
+                            item=None,
+                            skip_reason="deleting it would remove the last remaining copy of this file -- skipped",
                         )
-                        continue
-                try:
-                    send2trash(str(path))
-                except OSError as exc:
-                    failures.append(f"{path}: {exc}")
-                    continue
-                surviving.remove(path)
-            if len(surviving) > 1:
-                remaining_groups.append(
-                    DuplicateGroup(file_hash=group.file_hash, size=group.size, paths=surviving, confirmed=group.confirmed)
-                )
+                    )
+                else:
+                    # Verification of an unconfirmed group happens on the
+                    # worker thread (see DeleteWorker._execute), against
+                    # this group's kept copy.
+                    kept_refs = [] if group.confirmed else [kept]
+                    operations.append(
+                        DeleteOperation(kind="file", path=path, item=None, group=group, kept_refs=kept_refs)
+                    )
+                file_plan.append((group, path))
 
-        remaining_folder_groups = [fg for fg in result.folder_groups if fg not in confirmed_folder_groups] + [
-            FolderGroup(paths=surviving, file_count=fg.file_count, size=fg.size, confirmed=fg.confirmed)
-            for fg in confirmed_folder_groups
-            for surviving in [[p for p in fg.paths if p not in deleted_dirs]]
-            if len(surviving) > 1
-        ]
+        def on_finished(outcomes: list[DeleteOutcome]) -> None:
+            failures: list[str] = []
+            deleted_dirs: set[Path] = set()
+            surviving: dict[int, list[Path]] = {id(group): list(group.paths) for group, _kept, _targets in file_plans}
 
-        self._last_result = ScanResult(
-            groups=remaining_groups,
-            skipped=result.skipped,
-            cancelled=result.cancelled,
-            resume_state=result.resume_state,
-            folder_groups=remaining_folder_groups,
-            reused_run_id=result.reused_run_id,
-        )
-        self._render_results()
-        has_remaining = bool(remaining_groups or remaining_folder_groups)
-        self.delete_btn.setEnabled(has_remaining)
-        self.delete_all_btn.setEnabled(has_remaining)
-        if failures:
-            QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
+            folder_outcomes = outcomes[: len(folder_plan)]
+            file_outcomes = outcomes[len(folder_plan) :]
+
+            for (_fg, path), outcome in zip(folder_plan, folder_outcomes):
+                if outcome.ok:
+                    deleted_dirs.add(path)
+                else:
+                    failures.append(outcome.message)
+
+            for (group, path), outcome in zip(file_plan, file_outcomes):
+                if outcome.ok:
+                    surviving[id(group)].remove(path)
+                elif outcome.message is not None:
+                    failures.append(outcome.message)
+
+            remaining_groups: list[DuplicateGroup] = []
+            for group, _kept, _targets in file_plans:
+                surv = surviving[id(group)]
+                if len(surv) > 1:
+                    remaining_groups.append(
+                        DuplicateGroup(file_hash=group.file_hash, size=group.size, paths=surv, confirmed=group.confirmed)
+                    )
+
+            remaining_folder_groups = [fg for fg in result.folder_groups if fg not in confirmed_folder_groups] + [
+                FolderGroup(paths=surv2, file_count=fg.file_count, size=fg.size, confirmed=fg.confirmed)
+                for fg in confirmed_folder_groups
+                for surv2 in [[p for p in fg.paths if p not in deleted_dirs]]
+                if len(surv2) > 1
+            ]
+
+            self._last_result = ScanResult(
+                groups=remaining_groups,
+                skipped=result.skipped,
+                cancelled=result.cancelled,
+                resume_state=result.resume_state,
+                folder_groups=remaining_folder_groups,
+                reused_run_id=result.reused_run_id,
+            )
+            self._render_results()
+            has_remaining = bool(remaining_groups or remaining_folder_groups)
+            self.delete_btn.setEnabled(has_remaining)
+            self.delete_all_btn.setEnabled(has_remaining)
+            if failures:
+                QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
+
+        self._run_delete_operations(operations, on_finished)
 
     # -- window lifecycle -----------------------------------------------
 
@@ -867,6 +916,12 @@ class MainWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(2000)
+        if self._delete_worker is not None and self._delete_worker.isRunning():
+            # No cancel() here, unlike the scan worker -- a delete/move
+            # batch is short-lived enough (unlike a multi-hour scan) that
+            # letting it finish (or hit the wait timeout) is preferable to
+            # leaving a Trash move half-applied.
+            self._delete_worker.wait(2000)
         event.accept()
 
 

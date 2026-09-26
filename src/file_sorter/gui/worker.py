@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
 from PySide6.QtCore import QThread, Signal
+from send2trash import send2trash
 
-from ..dedupe import ScanResult, find_duplicates, scan_or_reuse
+from ..dedupe import DuplicateGroup, ScanResult, files_equal, find_duplicates, scan_or_reuse
 from ..store import CheckpointDelta, ResumeState, checkpoint_progress
 
 
@@ -67,3 +69,96 @@ class ScanWorker(QThread):
         else:
             result = find_duplicates(self._directories, **common_kwargs)
         self.finished_scan.emit(result)
+
+
+@dataclass
+class DeleteOperation:
+    """One planned move-to-Trash of a single file or folder, prepared by
+    the GUI thread (where the tree/checkbox state and the safety checks
+    that depend on it live) and then handed to `DeleteWorker` to actually
+    carry out off the UI thread. `item` is only touched again once this
+    comes back on the GUI thread via `DeleteOutcome` -- the worker itself
+    never reads or writes it, so holding a `QTreeWidgetItem` reference
+    here is safe despite running on a worker thread.
+    """
+
+    kind: str  # "folder" | "file"
+    path: Path
+    item: object = None
+    group: Optional[DuplicateGroup] = None
+    # Reference copy/copies to verify an unconfirmed group's file against
+    # right before deleting it (see DuplicateGroup.confirmed) -- empty
+    # when group is None or already confirmed.
+    kept_refs: list[Path] = field(default_factory=list)
+    # Precomputed reason this item must NOT be deleted (e.g. it would be
+    # the last surviving copy) -- set, skip straight to a failure outcome.
+    skip_reason: Optional[str] = None
+    # Already accounted for by another operation in this same batch (e.g.
+    # a file sitting under a folder that's also being deleted) -- no
+    # actual Trash call is made, but it still counts as a successful
+    # outcome so the caller cleans up bookkeeping (tree item / surviving
+    # list) the same way as an actually-deleted item.
+    already_handled: bool = False
+
+
+@dataclass
+class DeleteOutcome:
+    op: DeleteOperation
+    ok: bool
+    message: Optional[str] = None
+
+
+class DeleteWorker(QThread):
+    """Carries out a batch of `DeleteOperation`s (Trash moves) off the UI
+    thread, same reasoning as `ScanWorker`: send2trash and the
+    byte-for-byte verification of an unconfirmed group can each be slow
+    enough, over many items, to freeze the window if run inline with a
+    button click.
+    """
+
+    progress = Signal(int, int)  # done, total
+    finished_delete = Signal(list)  # list[DeleteOutcome]
+
+    def __init__(self, operations: list[DeleteOperation], parent=None) -> None:
+        super().__init__(parent)
+        self._operations = operations
+
+    def run(self) -> None:
+        outcomes: list[DeleteOutcome] = []
+        total = len(self._operations)
+        for index, op in enumerate(self._operations, start=1):
+            outcomes.append(self._execute(op))
+            self.progress.emit(index, total)
+        self.finished_delete.emit(outcomes)
+
+    def _execute(self, op: DeleteOperation) -> DeleteOutcome:
+        if op.already_handled:
+            return DeleteOutcome(op, True)
+        if op.skip_reason is not None:
+            return DeleteOutcome(op, False, f"{op.path}: {op.skip_reason}")
+
+        if op.group is not None and not op.group.confirmed:
+            # Confirmation of this group was deferred during the scan (a
+            # very large file) -- do it now, against whichever file(s) in
+            # the group are being kept, before actually deleting anything.
+            verified = False
+            for reference in op.kept_refs:
+                try:
+                    if files_equal(reference, op.path):
+                        verified = True
+                        break
+                except OSError:
+                    continue
+            if not verified:
+                return DeleteOutcome(
+                    op,
+                    False,
+                    f"{op.path}: not verified as an actual duplicate of the kept file(s) -- "
+                    "skipped rather than risk deleting a non-duplicate",
+                )
+
+        try:
+            send2trash(str(op.path))
+        except OSError as exc:
+            return DeleteOutcome(op, False, f"{op.path}: {exc}")
+        return DeleteOutcome(op, True)
