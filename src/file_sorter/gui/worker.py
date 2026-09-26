@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,15 +72,32 @@ class ScanWorker(QThread):
         self.finished_scan.emit(result)
 
 
+def _move_into(path: Path, dest_dir: Path) -> None:
+    """Moves `path` (a file, or a whole duplicate-folder directory) into
+    `dest_dir`, appending " (1)", " (2)", etc. to the name if something's
+    already there -- duplicate copies pulled from different source
+    directories can easily share a filename, and a plain move would
+    otherwise silently overwrite whatever's already at the destination.
+    """
+    target = dest_dir / path.name
+    counter = 1
+    while target.exists():
+        target = dest_dir / f"{path.stem} ({counter}){path.suffix}"
+        counter += 1
+    shutil.move(str(path), str(target))
+
+
 @dataclass
 class DeleteOperation:
-    """One planned move-to-Trash of a single file or folder, prepared by
-    the GUI thread (where the tree/checkbox state and the safety checks
-    that depend on it live) and then handed to `DeleteWorker` to actually
-    carry out off the UI thread. `item` is only touched again once this
-    comes back on the GUI thread via `DeleteOutcome` -- the worker itself
-    never reads or writes it, so holding a `QTreeWidgetItem` reference
-    here is safe despite running on a worker thread.
+    """One planned removal of a single file or folder -- either a
+    move-to-Trash or, when `dest_dir` is set, a move into that folder
+    instead -- prepared by the GUI thread (where the tree/checkbox state
+    and the safety checks that depend on it live) and then handed to
+    `DeleteWorker` to actually carry out off the UI thread. `item` is only
+    touched again once this comes back on the GUI thread via
+    `DeleteOutcome` -- the worker itself never reads or writes it, so
+    holding a `QTreeWidgetItem` reference here is safe despite running on
+    a worker thread.
     """
 
     kind: str  # "folder" | "file"
@@ -90,15 +108,18 @@ class DeleteOperation:
     # right before deleting it (see DuplicateGroup.confirmed) -- empty
     # when group is None or already confirmed.
     kept_refs: list[Path] = field(default_factory=list)
-    # Precomputed reason this item must NOT be deleted (e.g. it would be
+    # Precomputed reason this item must NOT be removed (e.g. it would be
     # the last surviving copy) -- set, skip straight to a failure outcome.
     skip_reason: Optional[str] = None
     # Already accounted for by another operation in this same batch (e.g.
-    # a file sitting under a folder that's also being deleted) -- no
-    # actual Trash call is made, but it still counts as a successful
+    # a file sitting under a folder that's also being removed) -- no
+    # actual Trash/move call is made, but it still counts as a successful
     # outcome so the caller cleans up bookkeeping (tree item / surviving
-    # list) the same way as an actually-deleted item.
+    # list) the same way as an actually-removed item.
     already_handled: bool = False
+    # None -> move to Trash (the default). Set -> move into this folder
+    # instead, via `_move_into` -- see `_move_checked`/`_move_all_duplicates`.
+    dest_dir: Optional[Path] = None
 
 
 @dataclass
@@ -140,7 +161,7 @@ class DeleteWorker(QThread):
         if op.group is not None and not op.group.confirmed:
             # Confirmation of this group was deferred during the scan (a
             # very large file) -- do it now, against whichever file(s) in
-            # the group are being kept, before actually deleting anything.
+            # the group are being kept, before actually removing anything.
             verified = False
             for reference in op.kept_refs:
                 try:
@@ -150,15 +171,19 @@ class DeleteWorker(QThread):
                 except OSError:
                     continue
             if not verified:
+                verb = "moving" if op.dest_dir is not None else "deleting"
                 return DeleteOutcome(
                     op,
                     False,
                     f"{op.path}: not verified as an actual duplicate of the kept file(s) -- "
-                    "skipped rather than risk deleting a non-duplicate",
+                    f"skipped rather than risk {verb} a non-duplicate",
                 )
 
         try:
-            send2trash(str(op.path))
+            if op.dest_dir is not None:
+                _move_into(op.path, op.dest_dir)
+            else:
+                send2trash(str(op.path))
         except OSError as exc:
             return DeleteOutcome(op, False, f"{op.path}: {exc}")
         return DeleteOutcome(op, True)

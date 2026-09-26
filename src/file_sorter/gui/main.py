@@ -68,6 +68,8 @@ class MainWindow(QMainWindow):
 
         self._worker: Optional[ScanWorker] = None
         self._delete_worker: Optional[DeleteWorker] = None
+        self._delete_progress_label = "Deleting"
+        self._delete_done_label = "Delete complete"
         self._updating_check = False
         self._scan_directories: list[Path] = []
         self._scan_start: Optional[float] = None
@@ -173,9 +175,17 @@ class MainWindow(QMainWindow):
         self.delete_all_btn = QPushButton("Delete All Duplicates (to Trash)")
         self.delete_all_btn.clicked.connect(self._delete_all_duplicates)
         self.delete_all_btn.setEnabled(False)
+        self.move_btn = QPushButton("Move Checked to Folder...")
+        self.move_btn.clicked.connect(self._move_checked)
+        self.move_btn.setEnabled(False)
+        self.move_all_btn = QPushButton("Move All Duplicates to Folder...")
+        self.move_all_btn.clicked.connect(self._move_all_duplicates)
+        self.move_all_btn.setEnabled(False)
         bottom_row.addWidget(self.reclaimable_label, 1)
         bottom_row.addWidget(self.delete_btn)
         bottom_row.addWidget(self.delete_all_btn)
+        bottom_row.addWidget(self.move_btn)
+        bottom_row.addWidget(self.move_all_btn)
         layout.addLayout(bottom_row)
 
     # -- directory list -----------------------------------------------
@@ -208,6 +218,8 @@ class MainWindow(QMainWindow):
         self.resume_btn.setEnabled(False)
         self.delete_btn.setEnabled(False)
         self.delete_all_btn.setEnabled(False)
+        self.move_btn.setEnabled(False)
+        self.move_all_btn.setEnabled(False)
         self.results_tree.clear()
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Resuming scan..." if resume_state else "Scanning...")
@@ -286,6 +298,8 @@ class MainWindow(QMainWindow):
         self._render_results()
         self.delete_btn.setEnabled(bool(groups or folder_groups))
         self.delete_all_btn.setEnabled(bool(groups or folder_groups))
+        self.move_btn.setEnabled(bool(groups or folder_groups))
+        self.move_all_btn.setEnabled(bool(groups or folder_groups))
 
     def _cancel_scan(self) -> None:
         if self._worker is not None:
@@ -376,6 +390,8 @@ class MainWindow(QMainWindow):
         self._render_results()
         self.delete_btn.setEnabled(bool(result.groups))
         self.delete_all_btn.setEnabled(bool(result.groups))
+        self.move_btn.setEnabled(bool(result.groups))
+        self.move_all_btn.setEnabled(bool(result.groups))
         self._worker = None
 
     def _render_results(self) -> None:
@@ -606,15 +622,23 @@ class MainWindow(QMainWindow):
             self.results_tree.takeTopLevelItem(index)
 
     def _run_delete_operations(
-        self, operations: list[DeleteOperation], on_finished: Callable[[list[DeleteOutcome]], None]
+        self,
+        operations: list[DeleteOperation],
+        on_finished: Callable[[list[DeleteOutcome]], None],
+        *,
+        progress_label: str = "Deleting",
+        done_label: str = "Delete complete",
     ) -> None:
-        """Runs `operations` (moves to Trash) on a `DeleteWorker` off the
-        UI thread, driving the same progress bar/status label the scan
-        uses (see `_on_progress`) so a large delete/move batch gives the
-        same live feedback a scan does instead of freezing the window
-        until it's done. `on_finished` does the actual tree/result
-        bookkeeping once every operation has completed -- see the two
-        callers, `_delete_checked` and `_delete_all_duplicates`.
+        """Runs `operations` (moves to Trash, or -- when each op's
+        `dest_dir` is set -- moves into a chosen folder) on a
+        `DeleteWorker` off the UI thread, driving the same progress
+        bar/status label the scan uses (see `_on_progress`) so a large
+        delete/move batch gives the same live feedback a scan does
+        instead of freezing the window until it's done. `on_finished`
+        does the actual tree/result bookkeeping once every operation has
+        completed -- see the four callers, `_delete_checked`,
+        `_delete_all_duplicates`, `_move_checked` and
+        `_move_all_duplicates`.
         """
         if not operations:
             on_finished([])
@@ -623,10 +647,14 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(False)
         self.delete_btn.setEnabled(False)
         self.delete_all_btn.setEnabled(False)
+        self.move_btn.setEnabled(False)
+        self.move_all_btn.setEnabled(False)
         self.progress_bar.setRange(0, len(operations))
         self.progress_bar.setValue(0)
-        self.status_label.setText(f"Deleting: 0/{len(operations)}")
+        self.status_label.setText(f"{progress_label}: 0/{len(operations)}")
 
+        self._delete_progress_label = progress_label
+        self._delete_done_label = done_label
         self._delete_worker = DeleteWorker(operations)
         self._delete_worker.progress.connect(self._on_delete_progress)
         self._delete_worker.finished_delete.connect(lambda outcomes: self._on_delete_finished(outcomes, on_finished))
@@ -635,7 +663,7 @@ class MainWindow(QMainWindow):
     def _on_delete_progress(self, done: int, total: int) -> None:
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(done)
-        self.status_label.setText(f"Deleting: {done}/{total}")
+        self.status_label.setText(f"{self._delete_progress_label}: {done}/{total}")
 
     def _on_delete_finished(
         self, outcomes: list[DeleteOutcome], on_finished: Callable[[list[DeleteOutcome]], None]
@@ -643,11 +671,11 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
-        self.status_label.setText("Delete complete")
+        self.status_label.setText(self._delete_done_label)
         self._delete_worker = None
-        # Re-enables delete_btn/delete_all_btn according to what's left,
-        # and does the actual tree/result bookkeeping -- see the two
-        # callers of `_run_delete_operations`.
+        # Re-enables delete_btn/delete_all_btn/move_btn/move_all_btn
+        # according to what's left, and does the actual tree/result
+        # bookkeeping -- see the four callers of `_run_delete_operations`.
         on_finished(outcomes)
 
     def _delete_checked(self) -> None:
@@ -742,6 +770,8 @@ class MainWindow(QMainWindow):
             has_remaining = self.results_tree.topLevelItemCount() > 0
             self.delete_btn.setEnabled(has_remaining)
             self.delete_all_btn.setEnabled(has_remaining)
+            self.move_btn.setEnabled(has_remaining)
+            self.move_all_btn.setEnabled(has_remaining)
             if failures:
                 QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
 
@@ -905,10 +935,254 @@ class MainWindow(QMainWindow):
             has_remaining = bool(remaining_groups or remaining_folder_groups)
             self.delete_btn.setEnabled(has_remaining)
             self.delete_all_btn.setEnabled(has_remaining)
+            self.move_btn.setEnabled(has_remaining)
+            self.move_all_btn.setEnabled(has_remaining)
             if failures:
                 QMessageBox.warning(self, "Some items could not be deleted", "\n".join(failures))
 
         self._run_delete_operations(operations, on_finished)
+
+    # -- moving -----------------------------------------------------------
+
+    def _prompt_destination_folder(self) -> Optional[Path]:
+        directory = QFileDialog.getExistingDirectory(self, "Select destination folder")
+        return Path(directory).resolve() if directory else None
+
+    def _move_checked(self) -> None:
+        """Same plan and safety guards as `_delete_checked` -- a file
+        covered by a confirmed folder match is left to that folder's own
+        move, a copy is never moved if it would be the last surviving
+        one, and a deferred (very-large-file) group is verified against
+        its kept copy right before moving -- except every checked item is
+        moved into a chosen destination folder instead of Trash.
+        """
+        checked = self._checked_items()
+        if not checked:
+            return
+
+        dest_dir = self._prompt_destination_folder()
+        if dest_dir is None:
+            return
+
+        folder_items = []
+        file_items = []
+        for item in checked:
+            if isinstance(item.parent().data(0, Qt.ItemDataRole.UserRole), FolderGroup):
+                folder_items.append(item)
+            else:
+                file_items.append(item)
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm move",
+            f"Move {len(folder_items)} folder(s) and {len(file_items)} file(s) to {dest_dir}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        delete_dirs = [item.data(0, Qt.ItemDataRole.UserRole)[0] for item in folder_items]
+
+        def under_any(path: Path, roots: list[Path]) -> bool:
+            return any(path.is_relative_to(root) for root in roots)
+
+        checked_file_paths = {item.data(0, Qt.ItemDataRole.UserRole)[0] for item in file_items}
+
+        def has_survivor(group: DuplicateGroup, path: Path) -> bool:
+            return any(
+                p != path and not under_any(p, delete_dirs) and p not in checked_file_paths for p in group.paths
+            )
+
+        operations: list[DeleteOperation] = []
+
+        for item in folder_items:
+            path, _size = item.data(0, Qt.ItemDataRole.UserRole)
+            operations.append(DeleteOperation(kind="folder", path=path, item=item, dest_dir=dest_dir))
+
+        for item in file_items:
+            path, _size = item.data(0, Qt.ItemDataRole.UserRole)
+            if under_any(path, delete_dirs):
+                # Already handled by a folder-level move above.
+                operations.append(DeleteOperation(kind="file", path=path, item=item, already_handled=True))
+                continue
+
+            group_item = item.parent()
+            group: DuplicateGroup = group_item.data(0, Qt.ItemDataRole.UserRole)
+
+            if not has_survivor(group, path):
+                operations.append(
+                    DeleteOperation(
+                        kind="file",
+                        path=path,
+                        item=item,
+                        skip_reason="moving it would remove the last remaining copy of this file -- skipped",
+                    )
+                )
+                continue
+
+            kept_refs = self._kept_paths(group_item) if not group.confirmed else []
+            operations.append(
+                DeleteOperation(
+                    kind="file", path=path, item=item, group=group, kept_refs=kept_refs, dest_dir=dest_dir
+                )
+            )
+
+        def on_finished(outcomes: list[DeleteOutcome]) -> None:
+            failures = [outcome.message for outcome in outcomes if not outcome.ok]
+            for outcome in outcomes:
+                if outcome.ok:
+                    self._remove_item(outcome.op.item)
+            self._update_reclaimable_label()
+            has_remaining = self.results_tree.topLevelItemCount() > 0
+            self.delete_btn.setEnabled(has_remaining)
+            self.delete_all_btn.setEnabled(has_remaining)
+            self.move_btn.setEnabled(has_remaining)
+            self.move_all_btn.setEnabled(has_remaining)
+            if failures:
+                QMessageBox.warning(self, "Some items could not be moved", "\n".join(failures))
+
+        self._run_delete_operations(operations, on_finished, progress_label="Moving", done_label="Move complete")
+
+    def _move_all_duplicates(self) -> None:
+        """Moves every duplicate this scan found (not just the
+        `TOP_RESULTS_LIMIT` groups currently rendered) into a chosen
+        folder instead of Trash -- otherwise the exact same plan and
+        safety guards as `_delete_all_duplicates`; see there.
+        """
+        result = self._last_result
+        if result is None:
+            return
+
+        confirmed_folder_groups = [fg for fg in result.folder_groups if fg.confirmed]
+        confirmed_folder_dirs = [d for fg in confirmed_folder_groups for d in fg.paths]
+        delete_dirs = [path for fg in confirmed_folder_groups for path in fg.paths[1:]]
+
+        def covered(path: Path) -> bool:
+            return any(path.is_relative_to(d) for d in confirmed_folder_dirs)
+
+        def under_any(path: Path, roots: list[Path]) -> bool:
+            return any(path.is_relative_to(root) for root in roots)
+
+        file_plans: list[tuple[DuplicateGroup, Path, list[Path]]] = []
+        for group in result.groups:
+            uncovered = [p for p in group.paths if not covered(p)]
+            if len(uncovered) < 2:
+                continue
+            kept, *targets = uncovered
+            file_plans.append((group, kept, targets))
+
+        total_folders = sum(len(fg.paths) - 1 for fg in confirmed_folder_groups)
+        total_files = sum(len(targets) for _group, _kept, targets in file_plans)
+        if total_folders == 0 and total_files == 0:
+            QMessageBox.information(self, "Nothing to move", "No duplicate copies to move.")
+            return
+
+        dest_dir = self._prompt_destination_folder()
+        if dest_dir is None:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm move",
+            f"Move ALL duplicates found -- {total_folders} folder(s) and {total_files} file(s), "
+            f"keeping one copy of each. Move them all to {dest_dir}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        planned_moves = {target for _group, _kept, targets in file_plans for target in targets}
+
+        def has_survivor(group: DuplicateGroup, path: Path, kept: Path) -> bool:
+            return any(
+                p != path and not under_any(p, delete_dirs) and (p == kept or p not in planned_moves)
+                for p in group.paths
+            )
+
+        operations: list[DeleteOperation] = []
+        folder_plan: list[tuple[FolderGroup, Path]] = []
+        for fg in confirmed_folder_groups:
+            for path in fg.paths[1:]:
+                operations.append(DeleteOperation(kind="folder", path=path, item=None, dest_dir=dest_dir))
+                folder_plan.append((fg, path))
+
+        file_plan: list[tuple[DuplicateGroup, Path]] = []
+        for group, kept, targets in file_plans:
+            for path in targets:
+                if under_any(path, delete_dirs):
+                    # Already handled by a folder-level move above.
+                    operations.append(DeleteOperation(kind="file", path=path, item=None, already_handled=True))
+                elif not has_survivor(group, path, kept):
+                    operations.append(
+                        DeleteOperation(
+                            kind="file",
+                            path=path,
+                            item=None,
+                            skip_reason="moving it would remove the last remaining copy of this file -- skipped",
+                        )
+                    )
+                else:
+                    kept_refs = [] if group.confirmed else [kept]
+                    operations.append(
+                        DeleteOperation(
+                            kind="file", path=path, item=None, group=group, kept_refs=kept_refs, dest_dir=dest_dir
+                        )
+                    )
+                file_plan.append((group, path))
+
+        def on_finished(outcomes: list[DeleteOutcome]) -> None:
+            failures: list[str] = []
+            moved_dirs: set[Path] = set()
+            surviving: dict[int, list[Path]] = {id(group): list(group.paths) for group, _kept, _targets in file_plans}
+
+            folder_outcomes = outcomes[: len(folder_plan)]
+            file_outcomes = outcomes[len(folder_plan) :]
+
+            for (_fg, path), outcome in zip(folder_plan, folder_outcomes):
+                if outcome.ok:
+                    moved_dirs.add(path)
+                else:
+                    failures.append(outcome.message)
+
+            for (group, path), outcome in zip(file_plan, file_outcomes):
+                if outcome.ok:
+                    surviving[id(group)].remove(path)
+                elif outcome.message is not None:
+                    failures.append(outcome.message)
+
+            remaining_groups: list[DuplicateGroup] = []
+            for group, _kept, _targets in file_plans:
+                surv = surviving[id(group)]
+                if len(surv) > 1:
+                    remaining_groups.append(
+                        DuplicateGroup(file_hash=group.file_hash, size=group.size, paths=surv, confirmed=group.confirmed)
+                    )
+
+            remaining_folder_groups = [fg for fg in result.folder_groups if fg not in confirmed_folder_groups] + [
+                FolderGroup(paths=surv2, file_count=fg.file_count, size=fg.size, confirmed=fg.confirmed)
+                for fg in confirmed_folder_groups
+                for surv2 in [[p for p in fg.paths if p not in moved_dirs]]
+                if len(surv2) > 1
+            ]
+
+            self._last_result = ScanResult(
+                groups=remaining_groups,
+                skipped=result.skipped,
+                cancelled=result.cancelled,
+                resume_state=result.resume_state,
+                folder_groups=remaining_folder_groups,
+                reused_run_id=result.reused_run_id,
+            )
+            self._render_results()
+            has_remaining = bool(remaining_groups or remaining_folder_groups)
+            self.delete_btn.setEnabled(has_remaining)
+            self.delete_all_btn.setEnabled(has_remaining)
+            self.move_btn.setEnabled(has_remaining)
+            self.move_all_btn.setEnabled(has_remaining)
+            if failures:
+                QMessageBox.warning(self, "Some items could not be moved", "\n".join(failures))
+
+        self._run_delete_operations(operations, on_finished, progress_label="Moving", done_label="Move complete")
 
     # -- window lifecycle -----------------------------------------------
 
